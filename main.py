@@ -3,6 +3,8 @@
 このファイルがアプリケーションの起動入口であり、主に次の役割を持つ。
 
 - 数値入力欄、ファイル選択、実行ボタンを配置する
+- 日常計測用の基本タブと、全機能を持つアドバンスドタブを提供する
+- 入力設定をJSONへ保存し、起動時に自動で復元する
 - CSVまたはPicoScopeから参照波形と実測波形を個別に取得する
 - 入力値をSI単位へ変換して ``analysis_pipeline.py`` へ渡す
 - 解析を別スレッドで実行し、計算中も画面が固まらないようにする
@@ -25,6 +27,7 @@ from tkinter import filedialog, messagebox, ttk
 import numpy as np
 import pypicosdk as psdk
 from matplotlib import font_manager, rcParams
+from matplotlib.axes import Axes
 from matplotlib.backends.backend_tkagg import FigureCanvasTkAgg, NavigationToolbar2Tk
 from matplotlib.figure import Figure
 
@@ -41,6 +44,7 @@ from analysis_pipeline import (
     AnalysisResult,
     run_analysis,
 )
+from app_settings import ApplicationSettings, load_settings, save_settings
 from data_sources import CsvDataSource, SignalData
 from picoscope_acquisition import acquire_waveform
 from window_functions import WindowParameters, generate_window, save_window_csv
@@ -50,6 +54,7 @@ from window_functions import WindowParameters, generate_window, save_window_csv
 # UIの「選択」ボタンから、同梱外のCSVへ変更することもできる。
 DEFAULT_MEASUREMENT_PATH = APP_DIR / "data" / "hand-0001.csv"
 DEFAULT_REFERENCE_PATH = APP_DIR / "data" / "zero_ref.csv"
+SETTINGS_PATH = APP_DIR / "settings.json"
 
 
 def resolve_input_path(path: str | Path) -> Path:
@@ -87,6 +92,44 @@ SOURCE_PICOSCOPE = "PicoScope"
 METHOD_CORRELATION = "正規化相互相関"
 METHOD_SQUARED_ERROR = "二乗誤差（従来方式）"
 
+# 設定ファイルには、画面表示の文言に左右されない安定した識別子を保存する。
+# ここでのみJSON側の値とUI表示を相互変換する。
+SETTINGS_SOURCE_MODES = {
+    "csv": SOURCE_CSV,
+    "picoscope": SOURCE_PICOSCOPE,
+}
+SETTINGS_TRIGGER_DIRECTIONS = {
+    "falling": "立ち下がり",
+    "rising": "立ち上がり",
+    "above": "しきい値より上",
+    "below": "しきい値より下",
+    "either": "立ち上がりまたは立ち下がり",
+}
+SETTINGS_RESOLUTIONS = {
+    8: "8 bit",
+    12: "12 bit",
+    14: "14 bit",
+    15: "15 bit",
+    16: "16 bit",
+}
+SETTINGS_RANGES_MV = {
+    10: "±10 mV",
+    20: "±20 mV",
+    50: "±50 mV",
+    100: "±100 mV",
+    200: "±200 mV",
+    500: "±500 mV",
+    1000: "±1 V",
+    2000: "±2 V",
+    5000: "±5 V",
+    10000: "±10 V",
+    20000: "±20 V",
+}
+SETTINGS_MATCHING_METHODS = {
+    MATCH_CORRELATION: METHOD_CORRELATION,
+    MATCH_SQUARED_ERROR: METHOD_SQUARED_ERROR,
+}
+
 TRIGGER_DIRECTIONS = {
     "立ち下がり": psdk.TRIGGER_DIR.FALLING,
     "立ち上がり": psdk.TRIGGER_DIR.RISING,
@@ -114,6 +157,11 @@ PICOSCOPE_RANGES = {
     "±10 V": psdk.RANGE.V10,
     "±20 V": psdk.RANGE.V20,
 }
+
+# 基本タブからの取得ではChannel Aを±20 Vに固定する。アドバンスドタブでは
+# 従来どおりプルダウンの選択値を使うため、UI変数とは分けて定数化する。
+CHANNEL_A_FIXED_RANGE = "±20 V"
+CHANNEL_B_RANGE_VALUES = tuple(PICOSCOPE_RANGES)
 
 
 @dataclass(frozen=True)
@@ -188,6 +236,28 @@ def sample_interval_from_signal(signal: SignalData) -> float:
             "等間隔の波形データを使用してください。"
         )
     return sample_interval_s
+
+
+class TimeResolutionMismatchError(ValueError):
+    """参照波形と実測波形の時間分解能が一致しないことを表す。"""
+
+
+def require_matching_time_resolution(
+    reference_sample_interval_s: float,
+    measurement_sample_interval_s: float,
+) -> None:
+    """2波形の実サンプリング間隔が解析可能な範囲で一致するか検査する。"""
+
+    if not math.isclose(
+        measurement_sample_interval_s,
+        reference_sample_interval_s,
+        rel_tol=1e-5,
+        abs_tol=1e-15,
+    ):
+        raise TimeResolutionMismatchError(
+            "参照波形と実測波形の時間分解能（サンプリング間隔）が一致しません。"
+            "現在の時間分解能で参照波形を取り直してください。"
+        )
 
 
 def configure_plot_font() -> None:
@@ -271,10 +341,12 @@ class MeasurementApplication:
         self.current_measurement_sample_interval_s: float | None = None
         self.current_reference_sample_interval_s: float | None = None
         self.current_reference_source_mode: str | None = None
+        self.current_reference_channel_a_range: int | None = None
 
         self._create_variables()
         self._build_ui()
         self._draw_empty_plots()
+        self._load_startup_settings()
 
         # 距離欄でのEnterは新規取得＋計算、その他の欄では再計算にする。
         self.root.bind("<Return>", self._enter_pressed)
@@ -331,18 +403,123 @@ class MeasurementApplication:
         self.status_var = tk.StringVar(value="先に参照データを取得してください。")
 
     def _build_ui(self) -> None:
-        """左側の操作パネル、右側のグラフ、下部ステータス欄を組み立てる。"""
+        """基本・アドバンスドの2タブと、それぞれの計測画面を組み立てる。"""
 
         # ttkの共通見た目を設定する。解析結果だけ少し太字で強調する。
         style = ttk.Style(self.root)
         style.configure("TButton", padding=(8, 5))
         style.configure("Result.TLabel", font=("TkDefaultFont", 11, "bold"))
+        style.configure("BasicResult.TLabel", font=("TkDefaultFont", 15, "bold"))
+        style.configure("TNotebook.Tab", padding=(18, 8))
+        style.configure(
+            "RangeStep.TButton",
+            font=("TkDefaultFont", 18, "bold"),
+            padding=(14, 7),
+        )
+        style.configure(
+            "RangeValue.TLabel",
+            font=("TkDefaultFont", 13, "bold"),
+        )
 
         self.root.rowconfigure(0, weight=1)
         self.root.columnconfigure(0, weight=1)
 
+        self.notebook = ttk.Notebook(self.root)
+        self.notebook.grid(row=0, column=0, sticky="nsew")
+        self.basic_tab = ttk.Frame(self.notebook)
+        self.advanced_tab = ttk.Frame(self.notebook)
+        self.notebook.add(self.basic_tab, text="基本")
+        self.notebook.add(self.advanced_tab, text="アドバンスド")
+
+        self._build_basic_tab(self.basic_tab)
+        self._build_advanced_tab(self.advanced_tab)
+        # 2つのEntryは同じStringVarを共有し、どちらからでもEnter計測できる。
+        self.distance_entries = (self.basic_distance_entry, self.distance_entry)
+        self._update_channel_b_range_buttons()
+
+    def _build_basic_tab(self, parent: ttk.Frame) -> None:
+        """日常計測に必要な操作、主要結果、2グラフだけを配置する。"""
+
+        parent.rowconfigure(2, weight=1)
+        parent.columnconfigure(0, weight=1)
+
+        operation_frame = ttk.LabelFrame(parent, text="計測", padding=10)
+        operation_frame.grid(
+            row=0,
+            column=0,
+            sticky="ew",
+            padx=10,
+            pady=(10, 6),
+        )
+        operation_frame.columnconfigure(3, weight=1)
+
+        self.basic_acquire_button = ttk.Button(
+            operation_frame,
+            text="参照波形を取得",
+            command=self._basic_acquire_waveform,
+        )
+        self.basic_acquire_button.grid(row=0, column=0, padx=(0, 6), sticky="ew")
+        range_frame = ttk.LabelFrame(
+            operation_frame,
+            text="入力レンジ",
+            padding=(8, 4),
+        )
+        range_frame.grid(row=0, column=1, padx=(0, 18), sticky="ew")
+        ttk.Label(
+            range_frame,
+            text=f"A  {CHANNEL_A_FIXED_RANGE}（固定）",
+        ).grid(row=0, column=0, columnspan=4, sticky="w", pady=(0, 3))
+        ttk.Label(range_frame, text="B").grid(row=1, column=0, padx=(0, 6))
+        self._build_channel_b_range_stepper(range_frame, "basic", row=1, column=1)
+        ttk.Label(operation_frame, text="距離 [mm]").grid(
+            row=0,
+            column=2,
+            padx=(0, 6),
+            sticky="e",
+        )
+        self.basic_distance_entry = ttk.Entry(
+            operation_frame,
+            textvariable=self.distance_mm_var,
+            width=18,
+        )
+        self.basic_distance_entry.grid(row=0, column=3, sticky="ew")
+
+        result_frame = ttk.LabelFrame(parent, text="計算結果", padding=10)
+        result_frame.grid(row=1, column=0, sticky="ew", padx=10, pady=(0, 6))
+        basic_results = (
+            ("一致時間", self.result_time_var),
+            ("最良スコア", self.result_score_var),
+            ("音速", self.result_speed_var),
+        )
+        for column, (label, variable) in enumerate(basic_results):
+            result_frame.columnconfigure(column, weight=1)
+            card = ttk.LabelFrame(result_frame, text=label, padding=(14, 8))
+            card.grid(
+                row=0,
+                column=column,
+                sticky="nsew",
+                padx=(0 if column == 0 else 4, 0 if column == 2 else 4),
+            )
+            ttk.Label(
+                card,
+                textvariable=variable,
+                style="BasicResult.TLabel",
+                anchor="center",
+            ).pack(fill="x")
+
+        plot_frame = ttk.Frame(parent, padding=(8, 2, 8, 4))
+        plot_frame.grid(row=2, column=0, sticky="nsew")
+        self._build_basic_plots(plot_frame)
+        self._add_status_bar(parent, row=3)
+
+    def _build_advanced_tab(self, parent: ttk.Frame) -> None:
+        """従来の全設定・全グラフ画面を、そのままアドバンスドへ配置する。"""
+
+        parent.rowconfigure(0, weight=1)
+        parent.columnconfigure(0, weight=1)
+
         # Panedwindowにより、ユーザーが操作パネルとグラフの境界を左右へ動かせる。
-        paned = ttk.Panedwindow(self.root, orient="horizontal")
+        paned = ttk.Panedwindow(parent, orient="horizontal")
         paned.grid(row=0, column=0, sticky="nsew")
 
         controls = ScrollableControls(paned)
@@ -352,16 +529,61 @@ class MeasurementApplication:
 
         self._build_controls(controls.inner)
         self._build_plots(plot_frame)
+        self._add_status_bar(parent, row=1)
+
+    def _add_status_bar(self, parent: ttk.Frame, row: int) -> None:
+        """共有ステータスを各タブの最下部へ表示する。"""
 
         # 最下部には「解析中」「完了」「エラー」など現在状態を常時表示する。
         status = ttk.Label(
-            self.root,
+            parent,
             textvariable=self.status_var,
             anchor="w",
             relief="sunken",
             padding=(8, 4),
         )
-        status.grid(row=1, column=0, sticky="ew")
+        status.grid(row=row, column=0, sticky="ew")
+
+    def _build_channel_b_range_stepper(
+        self,
+        parent: ttk.Widget,
+        prefix: str,
+        *,
+        row: int,
+        column: int,
+    ) -> None:
+        """Channel Bレンジを一段ずつ変える大きな−/＋ボタンを配置する。"""
+
+        stepper = ttk.Frame(parent)
+        stepper.grid(row=row, column=column, sticky="ew")
+        stepper.columnconfigure(1, weight=1)
+
+        decrease_button = ttk.Button(
+            stepper,
+            text="−",
+            width=3,
+            style="RangeStep.TButton",
+            command=lambda: self._change_channel_b_range(-1),
+        )
+        decrease_button.grid(row=0, column=0, padx=(0, 8))
+        ttk.Label(
+            stepper,
+            textvariable=self.channel_b_range_var,
+            style="RangeValue.TLabel",
+            anchor="center",
+            width=10,
+        ).grid(row=0, column=1, sticky="ew")
+        increase_button = ttk.Button(
+            stepper,
+            text="＋",
+            width=3,
+            style="RangeStep.TButton",
+            command=lambda: self._change_channel_b_range(1),
+        )
+        increase_button.grid(row=0, column=2, padx=(8, 0))
+
+        setattr(self, f"{prefix}_range_decrease_button", decrease_button)
+        setattr(self, f"{prefix}_range_increase_button", increase_button)
 
     def _build_controls(self, parent: ttk.Frame) -> None:
         """入力項目を用途別のグループに分けて左パネルへ配置する。"""
@@ -433,19 +655,27 @@ class MeasurementApplication:
             self.picoscope_resolution_var,
             tuple(PICOSCOPE_RESOLUTIONS),
         )
-        self._add_combobox(
+        self.channel_a_range_combobox = self._add_combobox(
             picoscope_frame,
             4,
             "Channel Aレンジ",
             self.channel_a_range_var,
             tuple(PICOSCOPE_RANGES),
         )
-        self._add_combobox(
+        self.channel_b_range_combobox = self._add_combobox(
             picoscope_frame,
             5,
             "Channel Bレンジ",
             self.channel_b_range_var,
             tuple(PICOSCOPE_RANGES),
+        )
+        self.channel_a_range_combobox.bind(
+            "<<ComboboxSelected>>",
+            self._advanced_channel_a_range_changed,
+        )
+        self.channel_b_range_combobox.bind(
+            "<<ComboboxSelected>>",
+            self._advanced_channel_b_range_changed,
         )
 
         # --- フィルターグループ ---
@@ -508,9 +738,31 @@ class MeasurementApplication:
         self._add_entry(matching_frame, 4, "表示開始 [µs]", self.display_min_us_var)
         self._add_entry(matching_frame, 5, "表示終了 [µs]", self.display_max_us_var)
 
+        # --- 設定ファイル ---
+        settings_frame = ttk.LabelFrame(parent, text="設定ファイル", padding=8)
+        settings_frame.grid(row=5, column=0, sticky="ew", pady=(0, 8))
+        settings_frame.columnconfigure((0, 1), weight=1)
+        ttk.Label(
+            settings_frame,
+            text=f"{SETTINGS_PATH.name}（起動時に自動読込）",
+        ).grid(row=0, column=0, columnspan=2, sticky="w", pady=(0, 6))
+
+        self.save_settings_button = ttk.Button(
+            settings_frame,
+            text="設定を保存",
+            command=self._save_settings,
+        )
+        self.save_settings_button.grid(row=1, column=0, sticky="ew", padx=(0, 3))
+        self.load_settings_button = ttk.Button(
+            settings_frame,
+            text="設定を読み込む",
+            command=self._load_settings,
+        )
+        self.load_settings_button.grid(row=1, column=1, sticky="ew", padx=(3, 0))
+
         # --- 実行ボタン ---
         action_frame = ttk.LabelFrame(parent, text="実行", padding=8)
-        action_frame.grid(row=5, column=0, sticky="ew", pady=(0, 8))
+        action_frame.grid(row=6, column=0, sticky="ew", pady=(0, 8))
         action_frame.columnconfigure((0, 1), weight=1)
 
         # 参照と実測を別操作にし、試料を切り替えてから次の取得を開始できるようにする。
@@ -549,7 +801,7 @@ class MeasurementApplication:
 
         # --- 最新の数値結果 ---
         result_frame = ttk.LabelFrame(parent, text="計算結果", padding=8)
-        result_frame.grid(row=6, column=0, sticky="ew")
+        result_frame.grid(row=7, column=0, sticky="ew")
         result_frame.columnconfigure(1, weight=1)
         self._add_result_row(result_frame, 0, "一致時間", self.result_time_var)
         self._add_result_row(result_frame, 1, "最良スコア", self.result_score_var)
@@ -581,6 +833,22 @@ class MeasurementApplication:
         toolbar.update()
         toolbar.pack(side="left")
 
+    def _build_basic_plots(self, parent: ttk.Frame) -> None:
+        """基本タブ用のフィルター後波形・評価関数グラフを埋め込む。"""
+
+        parent.rowconfigure(0, weight=1)
+        parent.columnconfigure(0, weight=1)
+        self.basic_figure = Figure(
+            figsize=(12, 6),
+            dpi=100,
+            constrained_layout=True,
+        )
+        axes = self.basic_figure.subplots(1, 2)
+        self.basic_filtered_axis = axes[0]
+        self.basic_matching_axis = axes[1]
+        self.basic_canvas = FigureCanvasTkAgg(self.basic_figure, master=parent)
+        self.basic_canvas.get_tk_widget().grid(row=0, column=0, sticky="nsew")
+
     @staticmethod
     def _add_entry(
         parent: ttk.Frame,
@@ -604,19 +872,21 @@ class MeasurementApplication:
         label: str,
         variable: tk.StringVar,
         values: tuple[str, ...],
-    ) -> None:
+    ) -> ttk.Combobox:
         """チャンネルや照合方式など、選択式入力欄を追加する。"""
 
         ttk.Label(parent, text=label).grid(
             row=row, column=0, sticky="w", padx=(0, 6), pady=3
         )
-        ttk.Combobox(
+        combobox = ttk.Combobox(
             parent,
             textvariable=variable,
             values=values,
             state="readonly",
             width=20,
-        ).grid(row=row, column=1, sticky="ew", pady=3)
+        )
+        combobox.grid(row=row, column=1, sticky="ew", pady=3)
+        return combobox
 
     @staticmethod
     def _add_file_row(
@@ -682,8 +952,117 @@ class MeasurementApplication:
         if selected:
             self.reference_path_var.set(selected)
 
+    def _change_channel_b_range(self, step: int) -> None:
+        """Channel Bレンジを対応レンジ一覧の隣へ一段だけ変更する。"""
+
+        if self._busy:
+            return
+        if step not in (-1, 1):
+            raise ValueError("レンジの変更量は−1または＋1で指定してください。")
+
+        try:
+            current_index = CHANNEL_B_RANGE_VALUES.index(
+                self.channel_b_range_var.get()
+            )
+        except ValueError as exc:
+            raise ValueError("対応していないChannel B入力レンジです。") from exc
+
+        next_index = min(
+            max(current_index + step, 0),
+            len(CHANNEL_B_RANGE_VALUES) - 1,
+        )
+        if next_index == current_index:
+            self._update_channel_b_range_buttons()
+            return
+
+        channel_b = CHANNEL_B_RANGE_VALUES[next_index]
+        self.channel_b_range_var.set(channel_b)
+        self._update_channel_b_range_buttons()
+        if self.source_mode_var.get() == SOURCE_PICOSCOPE:
+            self._discard_measurement_data()
+
+        reference_status = (
+            "。参照波形を保持し、次の実測取得で時間分解能を確認します"
+            if self.current_reference is not None
+            else ""
+        )
+        self.status_var.set(
+            f"Channel Bレンジを変更しました: {channel_b}{reference_status}"
+        )
+
+    def _update_channel_b_range_buttons(self) -> None:
+        """実行中とレンジ上下限を考慮し、基本タブの−/＋を更新する。"""
+
+        try:
+            current_index = CHANNEL_B_RANGE_VALUES.index(
+                self.channel_b_range_var.get()
+            )
+        except ValueError:
+            current_index = -1
+
+        decrease_state = (
+            "disabled" if self._busy or current_index <= 0 else "normal"
+        )
+        increase_state = (
+            "disabled"
+            if self._busy
+            or current_index < 0
+            or current_index >= len(CHANNEL_B_RANGE_VALUES) - 1
+            else "normal"
+        )
+        decrease_button = getattr(self, "basic_range_decrease_button", None)
+        increase_button = getattr(self, "basic_range_increase_button", None)
+        if decrease_button is not None:
+            decrease_button.configure(state=decrease_state)
+        if increase_button is not None:
+            increase_button.configure(state=increase_state)
+
+    def _advanced_channel_a_range_changed(self, _event: object = None) -> None:
+        """AdvancedでChannel Aレンジを変更し、参照再取得を要求する。"""
+
+        ranges = (
+            f"Channel A {self.channel_a_range_var.get()} / "
+            f"Channel B {self.channel_b_range_var.get()}"
+        )
+        if (
+            self.source_mode_var.get() == SOURCE_PICOSCOPE
+            and self.current_reference is not None
+        ):
+            self._discard_acquired_data()
+            self.status_var.set(
+                "Channel Aレンジを変更しました。"
+                f"参照波形を取り直してください: {ranges}"
+            )
+            return
+        self.status_var.set(f"Channel Aレンジを変更しました: {ranges}")
+
+    def _advanced_channel_b_range_changed(self, _event: object = None) -> None:
+        """AdvancedのChannel B変更を基本表示へ反映し、参照は保持する。"""
+
+        self._update_channel_b_range_buttons()
+        if self.source_mode_var.get() == SOURCE_PICOSCOPE:
+            self._discard_measurement_data()
+        ranges = (
+            f"Channel A {self.channel_a_range_var.get()} / "
+            f"Channel B {self.channel_b_range_var.get()}"
+        )
+        reference_status = (
+            "。参照波形を保持し、次の実測取得で時間分解能を確認します"
+            if self.current_reference is not None
+            else ""
+        )
+        self.status_var.set(
+            f"Channel Bレンジを変更しました: {ranges}{reference_status}"
+        )
+
     def _source_mode_changed(self, _event: object = None) -> None:
         """取得元を切り替えたとき、異なる取得元の波形が混ざるのを防ぐ。"""
+
+        self._discard_acquired_data()
+        self.status_var.set("取得元を変更しました。先に参照データを取得してください。")
+
+    def _discard_acquired_data(self) -> None:
+        """設定変更後に再利用できない取得済み波形と解析結果を破棄する。"""
 
         self.current_measurement = None
         self.current_reference = None
@@ -691,8 +1070,263 @@ class MeasurementApplication:
         self.current_measurement_sample_interval_s = None
         self.current_reference_sample_interval_s = None
         self.current_reference_source_mode = None
+        self.current_reference_channel_a_range = None
         self._clear_result_display()
-        self.status_var.set("取得元を変更しました。先に参照データを取得してください。")
+        self._update_basic_acquire_button()
+
+    def _discard_measurement_data(self) -> None:
+        """参照波形を残し、以前の実測波形と解析結果だけを破棄する。"""
+
+        self.current_measurement = None
+        self.current_measurement_sample_interval_s = None
+        self.current_result = None
+        self._clear_result_display()
+        self._update_basic_acquire_button()
+
+    @staticmethod
+    def _setting_key(
+        mapping: dict[object, str],
+        displayed_value: str,
+        label: str,
+    ) -> object:
+        """UIの表示値に対応する設定ファイル用の安定IDを返す。"""
+
+        for setting_value, display_value in mapping.items():
+            if display_value == displayed_value:
+                return setting_value
+        raise ValueError(f"「{label}」の選択値が不正です: {displayed_value}")
+
+    @staticmethod
+    def _portable_path_for_settings(path: str) -> str:
+        """アプリ内のCSVパスを、フォルダー移動に強い相対表記へ変換する。"""
+
+        if not path.strip():
+            return ""
+        resolved_path = resolve_input_path(path)
+        try:
+            return resolved_path.relative_to(APP_DIR).as_posix()
+        except ValueError:
+            return str(resolved_path)
+
+    def _settings_from_ui(self) -> ApplicationSettings:
+        """25個の入力欄を、検証可能な型付き設定へまとめる。"""
+
+        distance_text = self.distance_mm_var.get().strip()
+        distance_mm = (
+            self._parse_float(self.distance_mm_var, "距離")
+            if distance_text
+            else None
+        )
+        settings = ApplicationSettings(
+            source_mode=str(
+                self._setting_key(
+                    SETTINGS_SOURCE_MODES,
+                    self.source_mode_var.get(),
+                    "取得元",
+                )
+            ),
+            measurement_path=self._portable_path_for_settings(
+                self.measurement_path_var.get()
+            ),
+            reference_path=self._portable_path_for_settings(
+                self.reference_path_var.get()
+            ),
+            capture_duration_us=self._parse_float(
+                self.capture_duration_us_var,
+                "取得時間",
+            ),
+            trigger_a_threshold_mv=self._parse_float(
+                self.trigger_a_threshold_mv_var,
+                "Trigger A threshold",
+            ),
+            trigger_a_direction=str(
+                self._setting_key(
+                    SETTINGS_TRIGGER_DIRECTIONS,
+                    self.trigger_a_direction_var.get(),
+                    "Trigger A direction",
+                )
+            ),
+            resolution_bits=int(
+                self._setting_key(
+                    SETTINGS_RESOLUTIONS,
+                    self.picoscope_resolution_var.get(),
+                    "ADC分解能",
+                )
+            ),
+            channel_a_range_mv=int(
+                self._setting_key(
+                    SETTINGS_RANGES_MV,
+                    self.channel_a_range_var.get(),
+                    "Channel Aレンジ",
+                )
+            ),
+            channel_b_range_mv=int(
+                self._setting_key(
+                    SETTINGS_RANGES_MV,
+                    self.channel_b_range_var.get(),
+                    "Channel Bレンジ",
+                )
+            ),
+            sample_interval_ns=self._parse_float(
+                self.sample_interval_ns_var,
+                "サンプリング間隔",
+            ),
+            filter_low_mhz=self._parse_float(
+                self.filter_low_mhz_var,
+                "下限周波数",
+            ),
+            filter_high_mhz=self._parse_float(
+                self.filter_high_mhz_var,
+                "上限周波数",
+            ),
+            filter_order=self._parse_int(self.filter_order_var, "フィルター次数"),
+            filter_passes=self._parse_int(self.filter_passes_var, "フィルター回数"),
+            window_initial_us=self._parse_float(
+                self.window_initial_us_var,
+                "初期ゼロ",
+            ),
+            window_rise_us=self._parse_float(
+                self.window_rise_us_var,
+                "立ち上がり",
+            ),
+            window_flat_us=self._parse_float(
+                self.window_flat_us_var,
+                "フラット",
+            ),
+            window_fall_us=self._parse_float(
+                self.window_fall_us_var,
+                "立ち下がり",
+            ),
+            reference_start_us=self._parse_float(
+                self.reference_start_us_var,
+                "参照開始時間",
+            ),
+            measurement_channel=self._parse_int(
+                self.measurement_channel_var,
+                "測定チャンネル",
+            ),
+            reference_channel=self._parse_int(
+                self.reference_channel_var,
+                "参照チャンネル",
+            ),
+            matching_method=str(
+                self._setting_key(
+                    SETTINGS_MATCHING_METHODS,
+                    self.matching_method_var.get(),
+                    "照合方法",
+                )
+            ),
+            distance_mm=distance_mm,
+            display_min_us=self._parse_float(self.display_min_us_var, "表示開始"),
+            display_max_us=self._parse_float(self.display_max_us_var, "表示終了"),
+        )
+        settings.validate()
+        return settings
+
+    def _apply_settings(self, settings: ApplicationSettings) -> None:
+        """検証済み設定の全項目をUIへ一括反映する。"""
+
+        # ApplicationSettings.validate() 済みなので、各辞書の参照は必ず成功する。
+        self.source_mode_var.set(SETTINGS_SOURCE_MODES[settings.source_mode])
+        self.measurement_path_var.set(settings.measurement_path)
+        self.reference_path_var.set(settings.reference_path)
+        self.capture_duration_us_var.set(str(settings.capture_duration_us))
+        self.trigger_a_threshold_mv_var.set(str(settings.trigger_a_threshold_mv))
+        self.trigger_a_direction_var.set(
+            SETTINGS_TRIGGER_DIRECTIONS[settings.trigger_a_direction]
+        )
+        self.picoscope_resolution_var.set(
+            SETTINGS_RESOLUTIONS[settings.resolution_bits]
+        )
+        self.channel_a_range_var.set(
+            SETTINGS_RANGES_MV[settings.channel_a_range_mv]
+        )
+        self.channel_b_range_var.set(
+            SETTINGS_RANGES_MV[settings.channel_b_range_mv]
+        )
+        self.sample_interval_ns_var.set(str(settings.sample_interval_ns))
+        self.filter_low_mhz_var.set(str(settings.filter_low_mhz))
+        self.filter_high_mhz_var.set(str(settings.filter_high_mhz))
+        self.filter_order_var.set(str(settings.filter_order))
+        self.filter_passes_var.set(str(settings.filter_passes))
+        self.window_initial_us_var.set(str(settings.window_initial_us))
+        self.window_rise_us_var.set(str(settings.window_rise_us))
+        self.window_flat_us_var.set(str(settings.window_flat_us))
+        self.window_fall_us_var.set(str(settings.window_fall_us))
+        self.reference_start_us_var.set(str(settings.reference_start_us))
+        self.measurement_channel_var.set(str(settings.measurement_channel))
+        self.reference_channel_var.set(str(settings.reference_channel))
+        self.matching_method_var.set(
+            SETTINGS_MATCHING_METHODS[settings.matching_method]
+        )
+        self.distance_mm_var.set(
+            "" if settings.distance_mm is None else str(settings.distance_mm)
+        )
+        self.display_min_us_var.set(str(settings.display_min_us))
+        self.display_max_us_var.set(str(settings.display_max_us))
+        self._update_channel_b_range_buttons()
+
+    def _load_startup_settings(self) -> None:
+        """起動時に固定の設定ファイルを読み、失敗時は既定値で継続する。"""
+
+        if not SETTINGS_PATH.is_file():
+            self.status_var.set(
+                f"{SETTINGS_PATH.name} がないため既定値で起動しました。"
+                "先に参照データを取得してください。"
+            )
+            return
+
+        try:
+            settings = load_settings(SETTINGS_PATH)
+        except Exception as exc:
+            self.status_var.set(
+                "設定ファイルを読み込めなかったため、既定値で起動しました。"
+            )
+            messagebox.showwarning(
+                "設定ファイル",
+                f"{SETTINGS_PATH.name} を読み込めませんでした。\n"
+                f"既定値で起動します。\n\n{exc}",
+                parent=self.root,
+            )
+            return
+
+        self._apply_settings(settings)
+        self.status_var.set(
+            f"設定を読み込みました: {SETTINGS_PATH.name}。"
+            "先に参照データを取得してください。"
+        )
+
+    def _save_settings(self) -> None:
+        """現在の全入力値を、次回起動時に読む固定JSONへ保存する。"""
+
+        if self._busy:
+            return
+        try:
+            settings = self._settings_from_ui()
+            save_settings(settings, SETTINGS_PATH)
+        except Exception as exc:
+            self._show_error(exc)
+            return
+        self.status_var.set(f"設定を保存しました: {SETTINGS_PATH}")
+
+    def _load_settings(self) -> None:
+        """固定JSONを手動で再読込し、古い取得データを破棄する。"""
+
+        if self._busy:
+            return
+        try:
+            settings = load_settings(SETTINGS_PATH)
+        except Exception as exc:
+            self._show_error(exc)
+            return
+
+        self._apply_settings(settings)
+        # 取得元が同じでもCSVパスや取得条件が変わる可能性があるため必ず破棄する。
+        self._discard_acquired_data()
+        self.status_var.set(
+            f"設定を読み込みました: {SETTINGS_PATH.name}。"
+            "参照データを取り直してください。"
+        )
 
     @staticmethod
     def _parse_float(variable: tk.StringVar, label: str) -> float:
@@ -712,7 +1346,10 @@ class MeasurementApplication:
         except ValueError as exc:
             raise ValueError(f"「{label}」には整数を入力してください。") from exc
 
-    def _read_picoscope_settings(self) -> PicoScopeSettings:
+    def _read_picoscope_settings(
+        self,
+        channel_a_range_override: str | None = None,
+    ) -> PicoScopeSettings:
         """PicoScope設定欄を読み、取得モジュールへ渡す値へ変換する。"""
 
         duration_s = self._parse_float(
@@ -722,19 +1359,42 @@ class MeasurementApplication:
         if duration_s <= 0:
             raise ValueError("取得時間は0より大きくしてください。")
 
+        channel_a_range = (
+            channel_a_range_override
+            if channel_a_range_override is not None
+            else self.channel_a_range_var.get()
+        )
+        if channel_a_range not in PICOSCOPE_RANGES:
+            raise ValueError("対応していないChannel A入力レンジです。")
+        if self.channel_b_range_var.get() not in PICOSCOPE_RANGES:
+            raise ValueError("対応していないChannel B入力レンジです。")
+
+        trigger_a_threshold_mv = self._parse_float(
+            self.trigger_a_threshold_mv_var,
+            "Trigger A threshold",
+        )
+        channel_a_range_mv = int(
+            self._setting_key(
+                SETTINGS_RANGES_MV,
+                channel_a_range,
+                "Channel Aレンジ",
+            )
+        )
+        if abs(trigger_a_threshold_mv) > channel_a_range_mv:
+            raise ValueError(
+                "Trigger A thresholdをChannel Aの入力レンジ内にしてください。"
+            )
+
         return PicoScopeSettings(
             duration_s=duration_s,
-            trigger_a_threshold_mv=self._parse_float(
-                self.trigger_a_threshold_mv_var,
-                "Trigger A threshold",
-            ),
+            trigger_a_threshold_mv=trigger_a_threshold_mv,
             trigger_a_direction=TRIGGER_DIRECTIONS[
                 self.trigger_a_direction_var.get()
             ],
             resolution=PICOSCOPE_RESOLUTIONS[
                 self.picoscope_resolution_var.get()
             ],
-            channel_a_range=PICOSCOPE_RANGES[self.channel_a_range_var.get()],
+            channel_a_range=PICOSCOPE_RANGES[channel_a_range],
             channel_b_range=PICOSCOPE_RANGES[self.channel_b_range_var.get()],
         )
 
@@ -818,7 +1478,53 @@ class MeasurementApplication:
         window_parameters.validate()
         return parameters, window_parameters, (display_min_us, display_max_us)
 
-    def acquire_reference(self) -> None:
+    def _basic_acquire_waveform(self) -> None:
+        """基本タブの1ボタンで、必要な次の波形取得を実行する。"""
+
+        if not self._basic_reference_is_compatible():
+            if self.current_reference is not None:
+                self._discard_acquired_data()
+                self.status_var.set(
+                    "基本タブではChannel Aを±20 Vで使用します。"
+                    "参照波形を取り直します。"
+                )
+            self.acquire_reference(
+                channel_a_range_override=CHANNEL_A_FIXED_RANGE,
+            )
+        else:
+            self.acquire_and_analyze(
+                channel_a_range_override=CHANNEL_A_FIXED_RANGE,
+            )
+
+    def _basic_reference_is_compatible(self) -> bool:
+        """現在の参照波形を基本タブから再利用できるか返す。"""
+
+        if self.current_reference is None:
+            return False
+        if self.source_mode_var.get() != SOURCE_PICOSCOPE:
+            return True
+        # Bレンジ差は許容するが、基本タブのAは±20 V固定のためAだけ照合する。
+        return (
+            self.current_reference_channel_a_range
+            == PICOSCOPE_RANGES[CHANNEL_A_FIXED_RANGE]
+        )
+
+    def _update_basic_acquire_button(self) -> None:
+        """参照波形の有無に合わせて基本タブの取得操作を明示する。"""
+
+        if not hasattr(self, "basic_acquire_button"):
+            return
+        text = (
+            "実測波形を取得・計算"
+            if self._basic_reference_is_compatible()
+            else "参照波形を取得"
+        )
+        self.basic_acquire_button.configure(text=text)
+
+    def acquire_reference(
+        self,
+        channel_a_range_override: str | None = None,
+    ) -> None:
         """参照波形を取得して保持し、次の実測取得を待つ。"""
 
         if self._busy:
@@ -833,7 +1539,9 @@ class MeasurementApplication:
                 picoscope_settings = None
             else:
                 csv_source = None
-                picoscope_settings = self._read_picoscope_settings()
+                picoscope_settings = self._read_picoscope_settings(
+                    channel_a_range_override,
+                )
         except Exception as exc:
             self._show_error(exc)
             return
@@ -842,10 +1550,16 @@ class MeasurementApplication:
         self.current_reference = None
         self.current_reference_sample_interval_s = None
         self.current_reference_source_mode = None
+        self.current_reference_channel_a_range = (
+            None
+            if picoscope_settings is None
+            else picoscope_settings.channel_a_range
+        )
         self.current_measurement = None
         self.current_measurement_sample_interval_s = None
         self.current_result = None
         self._clear_result_display()
+        self._update_basic_acquire_button()
         self._set_busy(True)
         self.status_var.set("参照データを取得しています…")
 
@@ -899,28 +1613,43 @@ class MeasurementApplication:
         self.status_var.set(
             f"参照取得完了: {reference.source_name}。次に実測データを取得してください。"
         )
+        self._update_basic_acquire_button()
         self._set_busy(False)
+        self._select_distance_for_next_measurement()
 
     def _reference_acquisition_failed(self, error: Exception) -> None:
         """参照取得失敗時にUI操作を戻してエラーを表示する。"""
 
+        self.current_reference_channel_a_range = None
         self._set_busy(False)
         self.status_var.set("参照データの取得に失敗しました。")
+        self._update_basic_acquire_button()
         self._show_error(error)
 
-    def acquire_and_analyze(self) -> None:
+    def acquire_and_analyze(
+        self,
+        channel_a_range_override: str | None = None,
+    ) -> None:
         """実測波形を取得し、保持済みの参照波形を使って解析する。"""
 
-        self._start_analysis(load_new_data=True)
+        self._start_analysis(
+            load_new_data=True,
+            channel_a_range_override=channel_a_range_override,
+        )
 
     def _enter_pressed(self, event: tk.Event) -> str:
         """Enterを押した欄に応じて新規取得または再計算する。"""
 
-        if event.widget is self.distance_entry:
+        if event.widget in self.distance_entries:
             # 距離が空のときは、誤ったEnterで実機取得を開始しない。
             if self.distance_mm_var.get().strip():
-                # 「実測データを取得・計算」ボタンと同じ処理。
-                self.acquire_and_analyze()
+                if event.widget is self.basic_distance_entry:
+                    self.acquire_and_analyze(
+                        channel_a_range_override=CHANNEL_A_FIXED_RANGE,
+                    )
+                else:
+                    # Advancedの「実測データを取得・計算」と同じ処理。
+                    self.acquire_and_analyze()
         else:
             self.recalculate()
         # Tkのbindtags伝播を止め、1回のEnterで二重実行されるのを防ぐ。
@@ -936,7 +1665,11 @@ class MeasurementApplication:
             return
         self._start_analysis(load_new_data=False)
 
-    def _start_analysis(self, load_new_data: bool) -> None:
+    def _start_analysis(
+        self,
+        load_new_data: bool,
+        channel_a_range_override: str | None = None,
+    ) -> None:
         """入力値を確定し、データ取得と解析をバックグラウンドで実行する。"""
 
         # 連打によって複数解析が同時に走ると結果の表示順が入れ替わるため抑止する。
@@ -963,7 +1696,17 @@ class MeasurementApplication:
                     picoscope_settings = None
                 else:
                     measurement_source = None
-                    picoscope_settings = self._read_picoscope_settings()
+                    picoscope_settings = self._read_picoscope_settings(
+                        channel_a_range_override,
+                    )
+                    if (
+                        self.current_reference_channel_a_range
+                        != picoscope_settings.channel_a_range
+                    ):
+                        raise ValueError(
+                            "参照波形と実測波形のChannel Aレンジを"
+                            "同じ設定にしてください。参照波形を取り直してください。"
+                        )
                 measurement = None
                 reference = self.current_reference
                 sample_interval_s = None
@@ -1018,16 +1761,10 @@ class MeasurementApplication:
                     actual_sample_interval_s = sample_interval_from_signal(
                         acquired_measurement
                     )
-                if not math.isclose(
-                    actual_sample_interval_s,
+                require_matching_time_resolution(
                     reference_sample_interval_s,
-                    rel_tol=1e-5,
-                    abs_tol=1e-15,
-                ):
-                    raise ValueError(
-                        "参照データと実測データのサンプリング間隔が一致しません。"
-                        "同じ取得条件で取り直してください。"
-                    )
+                    actual_sample_interval_s,
+                )
                 measurement_is_reusable = True
 
                 # フィルター、窓、照合時間にはUIの旧値ではなく実機/時間列の値を使用する。
@@ -1106,6 +1843,15 @@ class MeasurementApplication:
 
         self._set_busy(False)
         self.current_result = None
+        if isinstance(error, TimeResolutionMismatchError):
+            # 新しい時間分解能の波形とは照合できないため、参照を明示的に
+            # 無効化して基本タブの次操作を参照取得へ戻す。
+            self._discard_acquired_data()
+            self.status_var.set(
+                "時間分解能が変わりました。参照波形を取り直してください。"
+            )
+            self._show_error(error)
+            return
         if measurement is None or sample_interval_s is None:
             self.status_var.set(
                 "実測データの取得または解析に失敗しました。"
@@ -1136,14 +1882,29 @@ class MeasurementApplication:
         self.acquire_button.configure(state=state)
         self.recalculate_button.configure(state=state)
         self.save_window_button.configure(state=state)
+        self.save_settings_button.configure(state=state)
+        self.load_settings_button.configure(state=state)
+        self.basic_acquire_button.configure(state=state)
+        self._update_channel_b_range_buttons()
+        range_combobox_state = "disabled" if busy else "readonly"
+        self.channel_a_range_combobox.configure(state=range_combobox_state)
+        self.channel_b_range_combobox.configure(state=range_combobox_state)
         self.source_combobox.configure(state="disabled" if busy else "readonly")
 
     def _select_distance_for_next_measurement(self) -> None:
         """次の数値入力で現在の距離をそのまま置き換えられるようにする。"""
 
-        self.distance_entry.focus_set()
-        self.distance_entry.icursor(tk.END)
-        self.distance_entry.selection_range(0, tk.END)
+        distance_entry = self._active_distance_entry()
+        distance_entry.focus_set()
+        distance_entry.icursor(tk.END)
+        distance_entry.selection_range(0, tk.END)
+
+    def _active_distance_entry(self) -> ttk.Entry:
+        """現在表示中のタブにある距離入力欄を返す。"""
+
+        if self.notebook.select() == str(self.basic_tab):
+            return self.basic_distance_entry
+        return self.distance_entry
 
     def _clear_result_display(self) -> None:
         """取得条件が変わったとき、以前の解析表示を消去する。"""
@@ -1155,13 +1916,15 @@ class MeasurementApplication:
         self._draw_empty_plots()
 
     def _draw_empty_plots(self) -> None:
-        """データ取得前の4グラフへ待機表示を描く。"""
+        """両タブの全グラフへデータ取得前の待機表示を描く。"""
 
         titles = (
             (self.raw_axis, "取得データ"),
             (self.filtered_axis, "フィルター後データ"),
             (self.window_axis, "窓関数・参照波形"),
             (self.matching_axis, "照合結果"),
+            (self.basic_filtered_axis, "データフィルタ後"),
+            (self.basic_matching_axis, "評価関数"),
         )
         for axis, title in titles:
             axis.clear()
@@ -1177,13 +1940,87 @@ class MeasurementApplication:
             )
             axis.grid(True, alpha=0.25)
         self.canvas.draw_idle()
+        self.basic_canvas.draw_idle()
+
+    @staticmethod
+    def _draw_filtered_axis(
+        axis: Axes,
+        result: AnalysisResult,
+        display_range: tuple[float, float],
+        title: str,
+    ) -> None:
+        """指定軸へCh1・Ch2のフィルター後波形を描く。"""
+
+        display_min_us, display_max_us = display_range
+        measurement_time_us = result.measurement.time_s * 1e6
+        axis.clear()
+        axis.plot(
+            measurement_time_us,
+            result.filtered_channel_1,
+            label="Ch1 filtered",
+            linewidth=0.9,
+        )
+        axis.plot(
+            measurement_time_us,
+            result.filtered_channel_2,
+            label="Ch2 filtered",
+            linewidth=0.9,
+        )
+        axis.set_title(title)
+        axis.set_xlabel("時間 [µs]")
+        axis.set_ylabel("電圧 [V]")
+        axis.set_xlim(display_min_us, display_max_us)
+        axis.legend(loc="upper right")
+
+    @staticmethod
+    def _draw_matching_axis(
+        axis: Axes,
+        result: AnalysisResult,
+        display_range: tuple[float, float],
+        title_prefix: str = "",
+    ) -> None:
+        """指定軸へ評価関数と最良一致位置を描く。"""
+
+        display_min_us, display_max_us = display_range
+        matching_time_us = result.matching_time_s * 1e6
+        best_time_us = result.best_time_s * 1e6
+        axis.clear()
+        axis.plot(
+            matching_time_us,
+            result.matching_score,
+            label="照合スコア",
+            linewidth=1.0,
+        )
+        axis.axvline(
+            best_time_us,
+            color="red",
+            linestyle="--",
+            linewidth=1.2,
+            label=f"一致位置 {best_time_us:.3f} µs",
+        )
+        axis.scatter(
+            [best_time_us],
+            [result.best_score],
+            color="red",
+            s=24,
+            zorder=3,
+        )
+        if result.matching_method == MATCH_CORRELATION:
+            axis.set_title(f"{title_prefix}正規化相互相関（最大位置を採用）")
+            axis.set_ylabel("相関係数")
+        else:
+            axis.set_title(f"{title_prefix}二乗誤差（最小位置を採用）")
+            axis.set_ylabel("二乗誤差")
+        axis.set_xlabel("時間 [µs]")
+        axis.set_xlim(max(0.0, display_min_us), display_max_us)
+        axis.legend(loc="upper right", fontsize=8)
 
     def _draw_result(
         self,
         result: AnalysisResult,
         display_range: tuple[float, float],
     ) -> None:
-        """1回分の解析結果を4枚のグラフへ描画する。
+        """1回分の解析結果をAdvancedの4枚とBasicの2枚へ描画する。
 
         左上: 取得したCh1・Ch2の生波形
         右上: Ch1・Ch2のバンドパスフィルター後波形
@@ -1216,24 +2053,12 @@ class MeasurementApplication:
         self.raw_axis.legend(loc="upper right")
 
         # --- 右上: 同じ全波形へフィルターを掛けた結果 ---
-        self.filtered_axis.clear()
-        self.filtered_axis.plot(
-            measurement_time_us,
-            result.filtered_channel_1,
-            label="Ch1 filtered",
-            linewidth=0.9,
+        self._draw_filtered_axis(
+            self.filtered_axis,
+            result,
+            display_range,
+            "バンドパスフィルター後",
         )
-        self.filtered_axis.plot(
-            measurement_time_us,
-            result.filtered_channel_2,
-            label="Ch2 filtered",
-            linewidth=0.9,
-        )
-        self.filtered_axis.set_title("バンドパスフィルター後")
-        self.filtered_axis.set_xlabel("時間 [µs]")
-        self.filtered_axis.set_ylabel("電圧 [V]")
-        self.filtered_axis.set_xlim(display_min_us, display_max_us)
-        self.filtered_axis.legend(loc="upper right")
 
         # --- 左下: 参照波形が窓関数によってどのように切り出されるかを表示 ---
         window_time_us = result.window.time_s * 1e6
@@ -1269,35 +2094,7 @@ class MeasurementApplication:
         self.window_axis.legend(loc="upper right", fontsize=8)
 
         # --- 右下: 参照波形を移動させた各位置の照合スコア ---
-        matching_time_us = result.matching_time_s * 1e6
-        best_time_us = result.best_time_s * 1e6
-        self.matching_axis.clear()
-        self.matching_axis.plot(
-            matching_time_us,
-            result.matching_score,
-            label="照合スコア",
-            linewidth=1.0,
-        )
-        self.matching_axis.axvline(
-            best_time_us,
-            color="red",
-            linestyle="--",
-            linewidth=1.2,
-            label=f"一致位置 {best_time_us:.3f} µs",
-        )
-        self.matching_axis.scatter(
-            [best_time_us], [result.best_score], color="red", s=24, zorder=3
-        )
-        # 相関と二乗誤差では、グラフの意味と最良値の向きが異なる。
-        if result.matching_method == MATCH_CORRELATION:
-            self.matching_axis.set_title("正規化相互相関（最大位置を採用）")
-            self.matching_axis.set_ylabel("相関係数")
-        else:
-            self.matching_axis.set_title("二乗誤差（最小位置を採用）")
-            self.matching_axis.set_ylabel("二乗誤差")
-        self.matching_axis.set_xlabel("時間 [µs]")
-        self.matching_axis.set_xlim(max(0.0, display_min_us), display_max_us)
-        self.matching_axis.legend(loc="upper right", fontsize=8)
+        self._draw_matching_axis(self.matching_axis, result, display_range)
 
         # 4グラフへ共通して薄いグリッドを表示し、値を読み取りやすくする。
         for axis in (
@@ -1308,7 +2105,24 @@ class MeasurementApplication:
         ):
             axis.grid(True, alpha=0.25)
 
+        # Basicでは、同じデータからフィルター後波形と評価関数だけを表示する。
+        self._draw_filtered_axis(
+            self.basic_filtered_axis,
+            result,
+            display_range,
+            "データフィルタ後",
+        )
+        self._draw_matching_axis(
+            self.basic_matching_axis,
+            result,
+            display_range,
+            title_prefix="評価関数：",
+        )
+        self.basic_filtered_axis.grid(True, alpha=0.25)
+        self.basic_matching_axis.grid(True, alpha=0.25)
+
         self.canvas.draw_idle()
+        self.basic_canvas.draw_idle()
 
     def _update_result_labels(self, result: AnalysisResult) -> None:
         """解析結果を読みやすい単位・桁数へ整形して左パネルへ表示する。"""

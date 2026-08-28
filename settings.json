@@ -1,0 +1,40 @@
+{
+  "version": 1,
+  "data_source": {
+    "mode": "picoscope",
+    "measurement_path": "data/hand-0001.csv",
+    "reference_path": "data/zero_ref.csv"
+  },
+  "picoscope": {
+    "capture_duration_us": 20.0,
+    "trigger_a_threshold_mv": -2000.0,
+    "trigger_a_direction": "falling",
+    "resolution_bits": 8,
+    "channel_a_range_mv": 20000,
+    "channel_b_range_mv": 10000
+  },
+  "filter": {
+    "sample_interval_ns": 8.0,
+    "low_mhz": 1.0,
+    "high_mhz": 5.0,
+    "order": 4,
+    "passes": 2
+  },
+  "window": {
+    "initial_zero_us": 0.75,
+    "rise_us": 0.1,
+    "flat_us": 0.5,
+    "fall_us": 0.5,
+    "reference_start_us": 0.0
+  },
+  "matching": {
+    "measurement_channel": 2,
+    "reference_channel": 2,
+    "method": "squared_error",
+    "distance_mm": null
+  },
+  "display": {
+    "min_us": 0.0,
+    "max_us": 20.0
+  }
+}
