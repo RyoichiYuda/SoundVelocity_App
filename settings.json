@@ -6,7 +6,7 @@
     "reference_path": "data/zero_ref.csv"
   },
   "picoscope": {
-    "capture_duration_us": 20.0,
+    "capture_duration_us": 40.0,
     "trigger_a_threshold_mv": -2000.0,
     "trigger_a_direction": "falling",
     "resolution_bits": 8,
@@ -14,7 +14,7 @@
     "channel_b_range_mv": 10000
   },
   "filter": {
-    "sample_interval_ns": 8.0,
+    "sample_interval_ns": 2.0,
     "low_mhz": 1.0,
     "high_mhz": 5.0,
     "order": 4,
@@ -31,10 +31,10 @@
     "measurement_channel": 2,
     "reference_channel": 2,
     "method": "squared_error",
-    "distance_mm": null
+    "distance_mm": 0.61
   },
   "display": {
     "min_us": 0.0,
-    "max_us": 20.0
+    "max_us": 40.0
   }
 }

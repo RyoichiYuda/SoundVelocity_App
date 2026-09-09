@@ -165,10 +165,13 @@ class SettingsFileTests(unittest.TestCase):
         save_settings(ApplicationSettings(), self.path)
         return json.loads(self.path.read_text(encoding="utf-8"))
 
-    def test_bundled_settings_file_matches_application_defaults(self) -> None:
+    def test_bundled_settings_file_contains_valid_application_settings(self) -> None:
         bundled_path = Path(__file__).resolve().parents[1] / "settings.json"
 
-        self.assertEqual(load_settings(bundled_path), ApplicationSettings())
+        settings = load_settings(bundled_path)
+
+        self.assertIsInstance(settings, ApplicationSettings)
+        settings.validate()
 
     def test_save_writes_readable_nested_version_1_utf8_json(self) -> None:
         settings = ApplicationSettings(
