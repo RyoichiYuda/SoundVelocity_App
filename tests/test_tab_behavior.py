@@ -278,6 +278,7 @@ class TabBehaviorTests(unittest.TestCase):
         application.acquire_reference = Mock()
         application.acquire_and_analyze = Mock()
         application.recalculate = Mock()
+        application._select_distance_for_next_measurement = Mock()
 
         application._set_basic_display_range(
             "通常",
@@ -304,6 +305,10 @@ class TabBehaviorTests(unittest.TestCase):
         application.acquire_reference.assert_not_called()
         application.acquire_and_analyze.assert_not_called()
         application.recalculate.assert_not_called()
+        self.assertEqual(
+            application._select_distance_for_next_measurement.call_count,
+            2,
+        )
         self.assertIn("拡大", application.status_var.get())
 
     def test_basic_display_time_preset_redraws_preview_without_matching_result(
@@ -320,6 +325,7 @@ class TabBehaviorTests(unittest.TestCase):
         application.status_var = FakeStringVar()
         application._draw_result = Mock()
         application._draw_basic_range_preview = Mock()
+        application._select_distance_for_next_measurement = Mock()
 
         application._set_basic_display_range(
             "拡大",
@@ -332,6 +338,7 @@ class TabBehaviorTests(unittest.TestCase):
         )
         application._draw_result.assert_not_called()
         self.assertEqual(application.result_speed_var.get(), "—")
+        application._select_distance_for_next_measurement.assert_called_once_with()
 
     def test_basic_display_time_preset_is_ignored_while_busy(self) -> None:
         application = object.__new__(main.MeasurementApplication)
@@ -341,6 +348,7 @@ class TabBehaviorTests(unittest.TestCase):
         application.current_result = object()
         application.status_var = FakeStringVar("busy")
         application._draw_result = Mock()
+        application._select_distance_for_next_measurement = Mock()
 
         application._set_basic_display_range(
             "通常",
@@ -350,6 +358,7 @@ class TabBehaviorTests(unittest.TestCase):
         self.assertEqual(application.display_min_us_var.get(), "5.0")
         self.assertEqual(application.display_max_us_var.get(), "60.0")
         application._draw_result.assert_not_called()
+        application._select_distance_for_next_measurement.assert_not_called()
         self.assertEqual(application.status_var.get(), "busy")
 
     def test_channel_b_range_stops_at_supported_minimum_and_maximum(self) -> None:

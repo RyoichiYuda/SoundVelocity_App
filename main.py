@@ -1161,6 +1161,7 @@ class MeasurementApplication:
         self.status_var.set(
             f"表示時間を{mode}（0–{display_max_us:g} µs）に変更しました。"
         )
+        self._select_distance_for_next_measurement()
 
     def _update_channel_b_range_buttons(self) -> None:
         """実行中とレンジ上下限を考慮し、基本タブの−/＋を更新する。"""
