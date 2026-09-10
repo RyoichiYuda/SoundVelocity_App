@@ -25,6 +25,19 @@ class FakeStringVar:
         self.value = str(value)
 
 
+class FakeBooleanVar:
+    """BooleanVarの真偽値を文字列化せず保持する最小代替。"""
+
+    def __init__(self, value: bool = False) -> None:
+        self.value = value
+
+    def get(self) -> bool:
+        return self.value
+
+    def set(self, value: object) -> None:
+        self.value = bool(value)
+
+
 SETTING_VARIABLE_NAMES = (
     "source_mode_var",
     "measurement_path_var",
@@ -51,6 +64,7 @@ SETTING_VARIABLE_NAMES = (
     "distance_mm_var",
     "display_min_us_var",
     "display_max_us_var",
+    "continuous_measurement_count_var",
 )
 
 
@@ -58,6 +72,9 @@ def make_application_without_tk() -> main.MeasurementApplication:
     application = object.__new__(main.MeasurementApplication)
     for variable_name in SETTING_VARIABLE_NAMES:
         setattr(application, variable_name, FakeStringVar())
+    application.continuous_measurement_enabled_var = FakeBooleanVar()
+    # 設定適用時のCombobox状態更新は、このテストではGUIなしに代替する。
+    application._update_continuous_measurement_controls = Mock()
     application.status_var = FakeStringVar()
     application._busy = False
     return application
@@ -92,6 +109,8 @@ class MainSettingsIntegrationTests(unittest.TestCase):
             distance_mm=12.3,
             display_min_us=-2.0,
             display_max_us=25.0,
+            continuous_measurement_enabled=True,
+            continuous_measurement_count=12,
         )
 
         application._apply_settings(expected)
@@ -107,6 +126,8 @@ class MainSettingsIntegrationTests(unittest.TestCase):
             "±500 mV",
         )
         self.assertEqual(application.matching_method_var.get(), main.METHOD_CORRELATION)
+        self.assertTrue(application.continuous_measurement_enabled_var.get())
+        self.assertEqual(application.continuous_measurement_count_var.get(), "12")
 
     def test_startup_load_applies_file_without_starting_acquisition(self) -> None:
         application = make_application_without_tk()

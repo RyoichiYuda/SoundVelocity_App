@@ -45,7 +45,14 @@ from analysis_pipeline import (
     butter_bandpass_filter,
     run_analysis,
 )
-from app_settings import ApplicationSettings, load_settings, save_settings
+from app_settings import (
+    CONTINUOUS_MEASUREMENT_DEFAULT_COUNT,
+    CONTINUOUS_MEASUREMENT_MAX_COUNT,
+    CONTINUOUS_MEASUREMENT_MIN_COUNT,
+    ApplicationSettings,
+    load_settings,
+    save_settings,
+)
 from data_sources import CsvDataSource, SignalData
 from picoscope_acquisition import acquire_waveform
 from window_functions import WindowParameters, generate_window, save_window_csv
@@ -444,6 +451,13 @@ class MeasurementApplication:
         self.distance_mm_var = tk.StringVar(value="")
         self.display_min_us_var = tk.StringVar(value="0.0")
         self.display_max_us_var = tk.StringVar(value="20.0")
+
+        # --- アドバンスドタブ専用の実験的な連続測定 ---
+        # 既定はOFFとし、基本タブと従来の単発測定に影響させない。
+        self.continuous_measurement_enabled_var = tk.BooleanVar(value=False)
+        self.continuous_measurement_count_var = tk.StringVar(
+            value=str(CONTINUOUS_MEASUREMENT_DEFAULT_COUNT)
+        )
 
         # --- 解析後に更新する結果とステータス表示 ---
         self.result_time_var = tk.StringVar(value="—")
@@ -938,9 +952,56 @@ class MeasurementApplication:
         self._add_entry(matching_frame, 4, "表示開始 [µs]", self.display_min_us_var)
         self._add_entry(matching_frame, 5, "表示終了 [µs]", self.display_max_us_var)
 
+        # --- 実験的な連続測定（アドバンスドのみ） ---
+        continuous_frame = ttk.LabelFrame(
+            parent,
+            text="連続測定（実験的）",
+            padding=8,
+        )
+        continuous_frame.grid(row=5, column=0, sticky="ew", pady=(0, 8))
+        continuous_frame.columnconfigure(1, weight=1)
+        self.continuous_measurement_checkbutton = ttk.Checkbutton(
+            continuous_frame,
+            text="連続測定をONにする",
+            variable=self.continuous_measurement_enabled_var,
+            command=self._update_continuous_measurement_controls,
+        )
+        self.continuous_measurement_checkbutton.grid(
+            row=0,
+            column=0,
+            columnspan=2,
+            sticky="w",
+            pady=(0, 6),
+        )
+        ttk.Label(continuous_frame, text="測定回数").grid(
+            row=1,
+            column=0,
+            sticky="w",
+            padx=(0, 8),
+        )
+        self.continuous_measurement_count_combobox = ttk.Combobox(
+            continuous_frame,
+            textvariable=self.continuous_measurement_count_var,
+            values=tuple(
+                str(count)
+                for count in range(
+                    CONTINUOUS_MEASUREMENT_MIN_COUNT,
+                    CONTINUOUS_MEASUREMENT_MAX_COUNT + 1,
+                )
+            ),
+            state="readonly",
+            width=8,
+        )
+        self.continuous_measurement_count_combobox.grid(
+            row=1,
+            column=1,
+            sticky="ew",
+        )
+        self._update_continuous_measurement_controls()
+
         # --- 設定ファイル ---
         settings_frame = ttk.LabelFrame(parent, text="設定ファイル", padding=8)
-        settings_frame.grid(row=5, column=0, sticky="ew", pady=(0, 8))
+        settings_frame.grid(row=6, column=0, sticky="ew", pady=(0, 8))
         settings_frame.columnconfigure((0, 1), weight=1)
         ttk.Label(
             settings_frame,
@@ -962,7 +1023,7 @@ class MeasurementApplication:
 
         # --- 実行ボタン ---
         action_frame = ttk.LabelFrame(parent, text="実行", padding=8)
-        action_frame.grid(row=6, column=0, sticky="ew", pady=(0, 8))
+        action_frame.grid(row=7, column=0, sticky="ew", pady=(0, 8))
         action_frame.columnconfigure((0, 1), weight=1)
 
         # 参照と実測を別操作にし、試料を切り替えてから次の取得を開始できるようにする。
@@ -978,7 +1039,7 @@ class MeasurementApplication:
         self.acquire_button = ttk.Button(
             action_frame,
             text="実測データを取得・計算",
-            command=self.acquire_and_analyze,
+            command=self._advanced_acquire_and_analyze,
         )
         self.acquire_button.grid(
             row=1, column=0, columnspan=2, sticky="ew", pady=(0, 6)
@@ -1001,7 +1062,7 @@ class MeasurementApplication:
 
         # --- 最新の数値結果 ---
         result_frame = ttk.LabelFrame(parent, text="計算結果", padding=8)
-        result_frame.grid(row=7, column=0, sticky="ew")
+        result_frame.grid(row=8, column=0, sticky="ew")
         result_frame.columnconfigure(1, weight=1)
         self._add_result_row(result_frame, 0, "一致時間", self.result_time_var)
         self._add_result_row(result_frame, 1, "最良スコア", self.result_score_var)
@@ -1262,6 +1323,25 @@ class MeasurementApplication:
         if plus_button is not None:
             plus_button.configure(state=plus_state)
 
+    def _update_continuous_measurement_controls(self) -> None:
+        """連続測定のON/OFFと実行中状態に合わせて入力を切り替える。"""
+
+        checkbutton = getattr(self, "continuous_measurement_checkbutton", None)
+        count_combobox = getattr(
+            self,
+            "continuous_measurement_count_combobox",
+            None,
+        )
+        if checkbutton is not None:
+            checkbutton.configure(state="disabled" if self._busy else "normal")
+        if count_combobox is not None:
+            count_state = (
+                "readonly"
+                if not self._busy and self.continuous_measurement_enabled_var.get()
+                else "disabled"
+            )
+            count_combobox.configure(state=count_state)
+
     def _advanced_channel_a_range_changed(self, _event: object = None) -> None:
         """AdvancedでChannel Aレンジを変更し、参照再取得を要求する。"""
 
@@ -1353,7 +1433,7 @@ class MeasurementApplication:
             return str(resolved_path)
 
     def _settings_from_ui(self) -> ApplicationSettings:
-        """25個の入力欄を、検証可能な型付き設定へまとめる。"""
+        """27個の入力欄を、検証可能な型付き設定へまとめる。"""
 
         distance_text = self.distance_mm_var.get().strip()
         distance_mm = (
@@ -1463,6 +1543,13 @@ class MeasurementApplication:
             distance_mm=distance_mm,
             display_min_us=self._parse_float(self.display_min_us_var, "表示開始"),
             display_max_us=self._parse_float(self.display_max_us_var, "表示終了"),
+            continuous_measurement_enabled=bool(
+                self.continuous_measurement_enabled_var.get()
+            ),
+            continuous_measurement_count=self._parse_int(
+                self.continuous_measurement_count_var,
+                "連続測定回数",
+            ),
         )
         settings.validate()
         return settings
@@ -1508,7 +1595,14 @@ class MeasurementApplication:
         )
         self.display_min_us_var.set(str(settings.display_min_us))
         self.display_max_us_var.set(str(settings.display_max_us))
+        self.continuous_measurement_enabled_var.set(
+            settings.continuous_measurement_enabled
+        )
+        self.continuous_measurement_count_var.set(
+            str(settings.continuous_measurement_count)
+        )
         self._update_channel_b_range_buttons()
+        self._update_continuous_measurement_controls()
 
     def _load_startup_settings(self) -> None:
         """起動時に固定の設定ファイルを読み、失敗時は既定値で継続する。"""
@@ -2018,13 +2112,46 @@ class MeasurementApplication:
     def acquire_and_analyze(
         self,
         channel_a_range_override: str | None = None,
+        measurement_count: int = 1,
     ) -> None:
         """実測波形を取得し、保持済みの参照波形を使って解析する。"""
 
         self._start_analysis(
             load_new_data=True,
             channel_a_range_override=channel_a_range_override,
+            measurement_count=measurement_count,
         )
+
+    def _advanced_acquire_and_analyze(self) -> None:
+        """Advancedの設定に応じ、1回または連続で実測・解析する。"""
+
+        if self._busy:
+            return
+
+        if not self.continuous_measurement_enabled_var.get():
+            self.acquire_and_analyze()
+            return
+
+        try:
+            measurement_count = self._parse_int(
+                self.continuous_measurement_count_var,
+                "連続測定回数",
+            )
+            if not (
+                CONTINUOUS_MEASUREMENT_MIN_COUNT
+                <= measurement_count
+                <= CONTINUOUS_MEASUREMENT_MAX_COUNT
+            ):
+                raise ValueError(
+                    "「連続測定回数」は"
+                    f"{CONTINUOUS_MEASUREMENT_MIN_COUNT}以上"
+                    f"{CONTINUOUS_MEASUREMENT_MAX_COUNT}以下にしてください。"
+                )
+        except Exception as exc:
+            self._show_error(exc)
+            return
+
+        self.acquire_and_analyze(measurement_count=measurement_count)
 
     def _enter_pressed(self, event: tk.Event) -> str:
         """Enterを押した欄に応じて新規取得または再計算する。"""
@@ -2038,7 +2165,7 @@ class MeasurementApplication:
                     )
                 else:
                     # Advancedの「実測データを取得・計算」と同じ処理。
-                    self.acquire_and_analyze()
+                    self._advanced_acquire_and_analyze()
         else:
             self.recalculate()
         # Tkのbindtags伝播を止め、1回のEnterで二重実行されるのを防ぐ。
@@ -2058,6 +2185,7 @@ class MeasurementApplication:
         self,
         load_new_data: bool,
         channel_a_range_override: str | None = None,
+        measurement_count: int = 1,
     ) -> None:
         """入力値を確定し、データ取得と解析をバックグラウンドで実行する。"""
 
@@ -2066,8 +2194,24 @@ class MeasurementApplication:
             return
 
         try:
+            if (
+                type(measurement_count) is not int
+                or measurement_count < 1
+                or measurement_count > CONTINUOUS_MEASUREMENT_MAX_COUNT
+            ):
+                raise ValueError(
+                    "測定回数は1以上"
+                    f"{CONTINUOUS_MEASUREMENT_MAX_COUNT}以下の整数にしてください。"
+                )
+            if not load_new_data and measurement_count != 1:
+                raise ValueError("連続測定は新規の実測取得でのみ実行できます。")
+
             # Tkinter変数はメインスレッドで読み取り、通常のPython値に変換しておく。
             parameters, window_parameters, display_range = self._read_inputs()
+            if measurement_count > 1 and (
+                parameters.distance_mm is None or parameters.distance_mm <= 0
+            ):
+                raise ValueError("連続測定では0より大きい距離を入力してください。")
             source_mode = self.source_mode_var.get()
             if self.current_reference is None:
                 raise ValueError("先に「参照データを取得」を実行してください。")
@@ -2119,61 +2263,96 @@ class MeasurementApplication:
         self.current_filtered_preview = None
         self._clear_result_display()
         self._set_busy(True)
-        action = "データを取得して解析しています…" if load_new_data else "再計算しています…"
+        if load_new_data and measurement_count > 1:
+            action = f"連続測定を開始します…（0/{measurement_count}回）"
+        else:
+            action = "データを取得して解析しています…" if load_new_data else "再計算しています…"
         self.status_var.set(action)
 
         def worker() -> None:
             """時間の掛かる取得・フィルター・相関処理を行う作業スレッド。"""
 
-            acquired_measurement = measurement
             acquired_reference = reference
+            acquired_measurement = measurement
             actual_sample_interval_s = sample_interval_s
             measurement_is_reusable = False
+            result: AnalysisResult | None = None
+            sound_speeds: list[float] = []
             try:
-                if load_new_data:
-                    if source_mode == SOURCE_CSV:
-                        assert measurement_source is not None
-                        acquired_measurement = measurement_source.acquire()
+                for measurement_index in range(measurement_count):
+                    if load_new_data:
+                        # 前回の取得成功状態を次回の失敗に引き継がない。
+                        acquired_measurement = None
+                        actual_sample_interval_s = None
+                        measurement_is_reusable = False
+                        if measurement_count > 1:
+                            self.root.after(
+                                0,
+                                lambda current=measurement_index + 1: self.status_var.set(
+                                    "連続測定中…"
+                                    f"（{current}/{measurement_count}回）"
+                                ),
+                            )
+                        if source_mode == SOURCE_CSV:
+                            assert measurement_source is not None
+                            acquired_measurement = measurement_source.acquire()
+                            actual_sample_interval_s = sample_interval_from_signal(
+                                acquired_measurement
+                            )
+                        else:
+                            assert picoscope_settings is not None
+                            acquired_measurement, actual_sample_interval_s = (
+                                acquire_picoscope_signal(
+                                    picoscope_settings,
+                                    "実測",
+                                )
+                            )
+                    assert acquired_measurement is not None
+                    assert acquired_reference is not None
+                    if actual_sample_interval_s is None:
                         actual_sample_interval_s = sample_interval_from_signal(
                             acquired_measurement
                         )
-                    else:
-                        assert picoscope_settings is not None
-                        acquired_measurement, actual_sample_interval_s = (
-                            acquire_picoscope_signal(
-                                picoscope_settings,
-                                "実測",
-                            )
-                        )
-                assert acquired_measurement is not None
-                assert acquired_reference is not None
-                if actual_sample_interval_s is None:
-                    actual_sample_interval_s = sample_interval_from_signal(
-                        acquired_measurement
+                    require_matching_time_resolution(
+                        reference_sample_interval_s,
+                        actual_sample_interval_s,
                     )
-                require_matching_time_resolution(
-                    reference_sample_interval_s,
-                    actual_sample_interval_s,
-                )
-                measurement_is_reusable = True
+                    measurement_is_reusable = True
 
-                # フィルター、窓、照合時間にはUIの旧値ではなく実機/時間列の値を使用する。
-                analysis_parameters = replace(
-                    parameters,
-                    sample_interval_s=actual_sample_interval_s,
-                )
-                analysis_window_parameters = replace(
-                    window_parameters,
-                    sample_interval_s=actual_sample_interval_s,
-                )
+                    # フィルター、窓、照合時間にはUIの旧値ではなく実機/時間列の値を使用する。
+                    analysis_parameters = replace(
+                        parameters,
+                        sample_interval_s=actual_sample_interval_s,
+                    )
+                    analysis_window_parameters = replace(
+                        window_parameters,
+                        sample_interval_s=actual_sample_interval_s,
+                    )
 
-                # UI部品を触らず、解析モジュールへ通常の配列と設定値だけを渡す。
-                result = run_analysis(
-                    acquired_measurement,
-                    acquired_reference,
-                    analysis_parameters,
-                    analysis_window_parameters,
-                )
+                    # UI部品を触らず、解析モジュールへ通常の配列と設定値だけを渡す。
+                    result = run_analysis(
+                        acquired_measurement,
+                        acquired_reference,
+                        analysis_parameters,
+                        analysis_window_parameters,
+                    )
+                    if measurement_count > 1:
+                        if result.sound_speed_m_s is None:
+                            raise ValueError(
+                                "連続測定では音速を計算できません。"
+                                "距離を確認してください。"
+                            )
+                        sound_speeds.append(result.sound_speed_m_s)
+
+                assert result is not None
+                if measurement_count > 1:
+                    # グラフと音速以外の結果は最終回、音速のみ全回平均とする。
+                    result = replace(
+                        result,
+                        sound_speed_m_s=(
+                            math.fsum(sound_speeds) / len(sound_speeds)
+                        ),
+                    )
             except Exception as exc:
                 self.root.after(
                     0,
@@ -2195,6 +2374,7 @@ class MeasurementApplication:
                     result,
                     display_range,
                     actual_sample_interval_s,
+                    measurement_count,
                 ),
             )
 
@@ -2206,6 +2386,7 @@ class MeasurementApplication:
         result: AnalysisResult,
         display_range: tuple[float, float],
         sample_interval_s: float | None,
+        measurement_count: int = 1,
     ) -> None:
         """解析成功時に最新データを保存し、グラフと結果ラベルを更新する。"""
 
@@ -2218,9 +2399,15 @@ class MeasurementApplication:
             self.sample_interval_ns_var.set(f"{sample_interval_s * 1e9:.9g}")
         self._draw_result(result, display_range)
         self._update_result_labels(result)
-        self.status_var.set(
-            f"完了: {result.measurement.source_name} / {result.reference.source_name}"
-        )
+        if measurement_count > 1:
+            self.status_var.set(
+                f"連続測定完了（{measurement_count}回の音速を平均）: "
+                f"{result.measurement.source_name} / {result.reference.source_name}"
+            )
+        else:
+            self.status_var.set(
+                f"完了: {result.measurement.source_name} / {result.reference.source_name}"
+            )
         self._set_busy(False)
         self._select_distance_for_next_measurement()
 
@@ -2280,6 +2467,7 @@ class MeasurementApplication:
         self.basic_display_normal_button.configure(state=state)
         self.basic_display_expanded_button.configure(state=state)
         self._update_channel_b_range_buttons()
+        self._update_continuous_measurement_controls()
         range_combobox_state = "disabled" if busy else "readonly"
         self.channel_a_range_combobox.configure(state=range_combobox_state)
         self.channel_b_range_combobox.configure(state=range_combobox_state)

@@ -28,6 +28,9 @@ PICOSCOPE_RESOLUTIONS_BITS = frozenset({8, 12, 14, 15, 16})
 PICOSCOPE_RANGES_MV = frozenset(
     {10, 20, 50, 100, 200, 500, 1_000, 2_000, 5_000, 10_000, 20_000}
 )
+CONTINUOUS_MEASUREMENT_MIN_COUNT = 2
+CONTINUOUS_MEASUREMENT_MAX_COUNT = 100
+CONTINUOUS_MEASUREMENT_DEFAULT_COUNT = 5
 
 _SECTION_KEYS = {
     "data_source": frozenset({"mode", "measurement_path", "reference_path"}),
@@ -57,6 +60,7 @@ _SECTION_KEYS = {
         {"measurement_channel", "reference_channel", "method", "distance_mm"}
     ),
     "display": frozenset({"min_us", "max_us"}),
+    "continuous_measurement": frozenset({"enabled", "count"}),
 }
 _DOCUMENT_KEYS = frozenset({"version", *_SECTION_KEYS})
 
@@ -91,6 +95,8 @@ _FIELD_LABELS = {
     "distance_mm": "距離 [mm]",
     "display_min_us": "表示開始 [µs]",
     "display_max_us": "表示終了 [µs]",
+    "continuous_measurement_enabled": "連続測定",
+    "continuous_measurement_count": "連続測定回数",
 }
 
 _FLOAT_FIELDS = (
@@ -140,9 +146,15 @@ def _require_integer(value: Any, field_name: str) -> int:
     return value
 
 
+def _require_boolean(value: Any, field_name: str) -> bool:
+    if type(value) is not bool:
+        raise SettingsError(f"「{_label(field_name)}」は真偽値で指定してください。")
+    return value
+
+
 @dataclass(frozen=True, slots=True)
 class ApplicationSettings:
-    """UIに表示する25個の設定項目。
+    """UIに表示する27個の設定項目。
 
     時間や周波数はUIと同じ単位で保持する。選択項目は翻訳された表示文言では
     なく、設定ファイルでも共通して使う安定IDを保持する。
@@ -183,6 +195,10 @@ class ApplicationSettings:
     display_min_us: float = 0.0
     display_max_us: float = 20.0
 
+    # 連続測定（アドバンスドタブのみ）
+    continuous_measurement_enabled: bool = False
+    continuous_measurement_count: int = CONTINUOUS_MEASUREMENT_DEFAULT_COUNT
+
     def __post_init__(self) -> None:
         """型を正規化した後、UIと解析で成立する範囲か検証する。"""
 
@@ -201,8 +217,14 @@ class ApplicationSettings:
             "filter_passes",
             "measurement_channel",
             "reference_channel",
+            "continuous_measurement_count",
         ):
             _require_integer(getattr(self, field_name), field_name)
+
+        _require_boolean(
+            self.continuous_measurement_enabled,
+            "continuous_measurement_enabled",
+        )
 
         for field_name in (
             "source_mode",
@@ -328,6 +350,16 @@ class ApplicationSettings:
             raise SettingsError("「距離 [mm]」は0以上にしてください。")
         if self.display_max_us <= self.display_min_us:
             raise SettingsError("表示終了時間は表示開始時間より大きくしてください。")
+        if not (
+            CONTINUOUS_MEASUREMENT_MIN_COUNT
+            <= self.continuous_measurement_count
+            <= CONTINUOUS_MEASUREMENT_MAX_COUNT
+        ):
+            raise SettingsError(
+                "「連続測定回数」は"
+                f"{CONTINUOUS_MEASUREMENT_MIN_COUNT}以上"
+                f"{CONTINUOUS_MEASUREMENT_MAX_COUNT}以下にしてください。"
+            )
 
 
 def _reject_duplicate_keys(pairs: list[tuple[str, Any]]) -> dict[str, Any]:
@@ -387,6 +419,7 @@ def _settings_from_document(document: Any) -> ApplicationSettings:
     window = _section(document, "window")
     matching = _section(document, "matching")
     display = _section(document, "display")
+    continuous_measurement = _section(document, "continuous_measurement")
 
     return ApplicationSettings(
         source_mode=_value(data_source, "mode", defaults.source_mode),
@@ -444,6 +477,16 @@ def _settings_from_document(document: Any) -> ApplicationSettings:
         distance_mm=_value(matching, "distance_mm", defaults.distance_mm),
         display_min_us=_value(display, "min_us", defaults.display_min_us),
         display_max_us=_value(display, "max_us", defaults.display_max_us),
+        continuous_measurement_enabled=_value(
+            continuous_measurement,
+            "enabled",
+            defaults.continuous_measurement_enabled,
+        ),
+        continuous_measurement_count=_value(
+            continuous_measurement,
+            "count",
+            defaults.continuous_measurement_count,
+        ),
     )
 
 
@@ -486,6 +529,10 @@ def _settings_to_document(settings: ApplicationSettings) -> dict[str, Any]:
         "display": {
             "min_us": settings.display_min_us,
             "max_us": settings.display_max_us,
+        },
+        "continuous_measurement": {
+            "enabled": settings.continuous_measurement_enabled,
+            "count": settings.continuous_measurement_count,
         },
     }
 
@@ -571,4 +618,11 @@ def save_settings(settings: ApplicationSettings, path: str | Path) -> None:
                 pass
 
 
-__all__ = ["ApplicationSettings", "load_settings", "save_settings"]
+__all__ = [
+    "ApplicationSettings",
+    "CONTINUOUS_MEASUREMENT_DEFAULT_COUNT",
+    "CONTINUOUS_MEASUREMENT_MAX_COUNT",
+    "CONTINUOUS_MEASUREMENT_MIN_COUNT",
+    "load_settings",
+    "save_settings",
+]

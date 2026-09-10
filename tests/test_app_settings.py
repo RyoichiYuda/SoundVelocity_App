@@ -17,8 +17,8 @@ from app_settings import (
 
 
 class ApplicationSettingsTests(unittest.TestCase):
-    def test_dataclass_has_all_25_ui_settings(self) -> None:
-        self.assertEqual(len(fields(ApplicationSettings)), 25)
+    def test_dataclass_has_all_27_ui_settings(self) -> None:
+        self.assertEqual(len(fields(ApplicationSettings)), 27)
         self.assertEqual(
             {field.name for field in fields(ApplicationSettings)},
             {
@@ -47,6 +47,8 @@ class ApplicationSettingsTests(unittest.TestCase):
                 "distance_mm",
                 "display_min_us",
                 "display_max_us",
+                "continuous_measurement_enabled",
+                "continuous_measurement_count",
             },
         )
 
@@ -60,6 +62,8 @@ class ApplicationSettingsTests(unittest.TestCase):
         self.assertEqual(settings.channel_b_range_mv, 10_000)
         self.assertEqual(settings.matching_method, "squared_error")
         self.assertIsNone(settings.distance_mm)
+        self.assertFalse(settings.continuous_measurement_enabled)
+        self.assertEqual(settings.continuous_measurement_count, 5)
 
     def test_direct_construction_normalizes_json_numbers_to_float(self) -> None:
         settings = ApplicationSettings(
@@ -78,6 +82,10 @@ class ApplicationSettingsTests(unittest.TestCase):
             {"filter_order": False},
             {"distance_mm": "10"},
             {"measurement_channel": "2"},
+            {"continuous_measurement_enabled": 0},
+            {"continuous_measurement_enabled": "false"},
+            {"continuous_measurement_count": 5.0},
+            {"continuous_measurement_count": False},
         )
 
         for arguments in invalid_arguments:
@@ -130,6 +138,8 @@ class ApplicationSettingsTests(unittest.TestCase):
             {"reference_channel": 0},
             {"distance_mm": -0.1},
             {"display_min_us": 10, "display_max_us": 10},
+            {"continuous_measurement_count": 1},
+            {"continuous_measurement_count": 101},
             {"capture_duration_us": float("nan")},
             {"display_max_us": float("inf")},
         )
@@ -199,11 +209,16 @@ class SettingsFileTests(unittest.TestCase):
                 "window",
                 "matching",
                 "display",
+                "continuous_measurement",
             },
         )
         self.assertEqual(document["data_source"]["mode"], "csv")
         self.assertEqual(document["picoscope"]["trigger_a_direction"], "falling")
         self.assertEqual(document["matching"]["method"], "squared_error")
+        self.assertEqual(
+            document["continuous_measurement"],
+            {"enabled": False, "count": 5},
+        )
 
     def test_round_trip_preserves_all_settings(self) -> None:
         settings = ApplicationSettings(
@@ -232,6 +247,8 @@ class SettingsFileTests(unittest.TestCase):
             distance_mm=12.34,
             display_min_us=-2,
             display_max_us=30,
+            continuous_measurement_enabled=True,
+            continuous_measurement_count=12,
         )
 
         save_settings(settings, self.path)
@@ -255,6 +272,14 @@ class SettingsFileTests(unittest.TestCase):
         self.assertEqual(loaded.capture_duration_us, defaults.capture_duration_us)
         self.assertEqual(loaded.reference_path, defaults.reference_path)
         self.assertEqual(loaded.distance_mm, defaults.distance_mm)
+        self.assertEqual(
+            loaded.continuous_measurement_enabled,
+            defaults.continuous_measurement_enabled,
+        )
+        self.assertEqual(
+            loaded.continuous_measurement_count,
+            defaults.continuous_measurement_count,
+        )
 
     def test_missing_version_is_rejected(self) -> None:
         self._write_document({})
@@ -266,6 +291,7 @@ class SettingsFileTests(unittest.TestCase):
         documents = (
             {"version": 1, "future_section": {}},
             {"version": 1, "filter": {"oder": 9}},
+            {"version": 1, "continuous_measurement": {"times": 5}},
         )
 
         for document in documents:
@@ -295,6 +321,8 @@ class SettingsFileTests(unittest.TestCase):
             ("filter", "order", True),
             ("matching", "distance_mm", False),
             ("data_source", "mode", 1),
+            ("continuous_measurement", "enabled", 1),
+            ("continuous_measurement", "count", 5.0),
         )
         base_document = self._default_document()
 

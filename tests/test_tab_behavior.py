@@ -11,7 +11,7 @@ import tkinter as tk
 from matplotlib.figure import Figure
 
 import main
-from tests.test_main_settings import FakeStringVar
+from tests.test_main_settings import FakeBooleanVar, FakeStringVar
 
 
 class FakeNotebook:
@@ -20,6 +20,101 @@ class FakeNotebook:
 
     def select(self) -> str:
         return self.selected
+
+
+def make_signal(source_name: str, marker: float = 0.0) -> main.SignalData:
+    """連続測定テスト用の小さな等間隔波形を作る。"""
+
+    time_s = np.arange(8, dtype=float) * 8e-9
+    channel_1 = np.arange(8, dtype=float) + marker
+    channel_2 = -channel_1
+    return main.SignalData(time_s, channel_1, channel_2, source_name)
+
+
+def make_analysis_result(
+    measurement: main.SignalData,
+    reference: main.SignalData,
+    sound_speed_m_s: float | None,
+    marker: float,
+) -> main.AnalysisResult:
+    """平均値と最終回の波形を識別できる解析結果を作る。"""
+
+    values = np.arange(8, dtype=float) + marker
+    return main.AnalysisResult(
+        measurement=measurement,
+        reference=reference,
+        filtered_channel_1=values,
+        filtered_channel_2=-values,
+        selected_measurement_time_s=measurement.time_s,
+        selected_measurement_filtered=values,
+        window=SimpleNamespace(
+            time_s=np.array([0.0, 8e-9]),
+            gain=np.array([0.0, 1.0]),
+        ),
+        reference_raw_normalized=values,
+        reference_filtered_normalized=values,
+        reference_windowed=values,
+        matching_time_s=np.array([0.0, 8e-9]),
+        matching_score=np.array([marker + 1.0, marker]),
+        matching_method=main.MATCH_SQUARED_ERROR,
+        best_index=1,
+        best_time_s=8e-9,
+        best_score=marker,
+        sound_speed_m_s=sound_speed_m_s,
+    )
+
+
+def make_ready_picoscope_application() -> tuple[
+    main.MeasurementApplication,
+    main.SignalData,
+    main.PicoScopeSettings,
+]:
+    """参照取得済みのPicoScope解析状態をGUIなしで作る。"""
+
+    application = object.__new__(main.MeasurementApplication)
+    application._busy = False
+    parameters = main.AnalysisParameters(
+        sample_interval_s=8e-9,
+        filter_low_hz=1e6,
+        filter_high_hz=5e6,
+        filter_order=4,
+        filter_passes=2,
+        distance_mm=10.0,
+    )
+    window_parameters = main.WindowParameters(sample_interval_s=8e-9)
+    application._read_inputs = Mock(
+        return_value=(parameters, window_parameters, (0.0, 20.0))
+    )
+    application.source_mode_var = FakeStringVar(main.SOURCE_PICOSCOPE)
+    reference = make_signal("reference")
+    application.current_reference = reference
+    application.current_reference_source_mode = main.SOURCE_PICOSCOPE
+    application.current_reference_sample_interval_s = 8e-9
+    picoscope_settings = main.PicoScopeSettings(
+        duration_s=20e-6,
+        trigger_a_threshold_mv=-2000.0,
+        trigger_a_direction=main.TRIGGER_DIRECTIONS["立ち下がり"],
+        resolution=main.PICOSCOPE_RESOLUTIONS["8 bit"],
+        channel_a_range=main.PICOSCOPE_RANGES["±20 V"],
+        channel_b_range=main.PICOSCOPE_RANGES["±10 V"],
+    )
+    application.current_reference_channel_a_range = picoscope_settings.channel_a_range
+    application._read_picoscope_settings = Mock(return_value=picoscope_settings)
+    application.current_measurement = None
+    application.current_measurement_sample_interval_s = None
+    application.current_result = None
+    application.current_filtered_preview = None
+    application.sample_interval_ns_var = FakeStringVar("8")
+    application.status_var = FakeStringVar()
+    application._clear_result_display = Mock()
+    application._set_busy = Mock()
+    application._draw_result = Mock()
+    application._update_result_labels = Mock()
+    application._show_error = Mock()
+    application._discard_acquired_data = Mock()
+    application._select_distance_for_next_measurement = Mock()
+    application.root = SimpleNamespace(after=lambda _delay, callback: callback())
+    return application, reference, picoscope_settings
 
 
 class TabBehaviorTests(unittest.TestCase):
@@ -63,6 +158,8 @@ class TabBehaviorTests(unittest.TestCase):
         application.acquire_reference = Mock()
         application.acquire_and_analyze = Mock()
         application.current_reference = None
+        application.continuous_measurement_enabled_var = FakeBooleanVar(True)
+        application.continuous_measurement_count_var = FakeStringVar("5")
 
         application._basic_acquire_measurement()
 
@@ -71,7 +168,70 @@ class TabBehaviorTests(unittest.TestCase):
             channel_a_range_override=main.CHANNEL_A_FIXED_RANGE,
         )
 
-    def test_enter_in_either_distance_entry_starts_one_new_acquisition(self) -> None:
+    def test_advanced_continuous_on_uses_selected_measurement_count(self) -> None:
+        application = object.__new__(main.MeasurementApplication)
+        application._busy = False
+        application.continuous_measurement_enabled_var = FakeBooleanVar(True)
+        application.continuous_measurement_count_var = FakeStringVar("4")
+        application.acquire_and_analyze = Mock()
+        application._show_error = Mock()
+
+        application._advanced_acquire_and_analyze()
+
+        application.acquire_and_analyze.assert_called_once_with(measurement_count=4)
+        application._show_error.assert_not_called()
+
+    def test_advanced_continuous_off_is_one_measurement_and_ignores_count(
+        self,
+    ) -> None:
+        application = object.__new__(main.MeasurementApplication)
+        application._busy = False
+        application.continuous_measurement_enabled_var = FakeBooleanVar(False)
+        # OFF時は回数欄を解釈せず、従来の単発を守る。
+        application.continuous_measurement_count_var = FakeStringVar("invalid")
+        application.acquire_and_analyze = Mock()
+        application._show_error = Mock()
+
+        application._advanced_acquire_and_analyze()
+
+        application.acquire_and_analyze.assert_called_once_with()
+        application._show_error.assert_not_called()
+
+    def test_advanced_continuous_rejects_invalid_count_before_acquisition(
+        self,
+    ) -> None:
+        for invalid_count in ("1", "101", "not-a-number"):
+            with self.subTest(invalid_count=invalid_count):
+                application = object.__new__(main.MeasurementApplication)
+                application._busy = False
+                application.continuous_measurement_enabled_var = FakeBooleanVar(True)
+                application.continuous_measurement_count_var = FakeStringVar(
+                    invalid_count
+                )
+                application.acquire_and_analyze = Mock()
+                application._show_error = Mock()
+
+                application._advanced_acquire_and_analyze()
+
+                application.acquire_and_analyze.assert_not_called()
+                application._show_error.assert_called_once()
+
+    def test_advanced_measurement_command_is_ignored_while_busy(self) -> None:
+        application = object.__new__(main.MeasurementApplication)
+        application._busy = True
+        application.continuous_measurement_enabled_var = Mock()
+        application.acquire_and_analyze = Mock()
+        application._show_error = Mock()
+
+        application._advanced_acquire_and_analyze()
+
+        application.continuous_measurement_enabled_var.get.assert_not_called()
+        application.acquire_and_analyze.assert_not_called()
+        application._show_error.assert_not_called()
+
+    def test_distance_enter_uses_basic_single_or_advanced_measurement_command(
+        self,
+    ) -> None:
         application = object.__new__(main.MeasurementApplication)
         basic_entry = object()
         advanced_entry = object()
@@ -79,6 +239,7 @@ class TabBehaviorTests(unittest.TestCase):
         application.distance_entries = (basic_entry, advanced_entry)
         application.distance_mm_var = FakeStringVar("12.5")
         application.acquire_and_analyze = Mock()
+        application._advanced_acquire_and_analyze = Mock()
         application.recalculate = Mock()
 
         for entry in application.distance_entries:
@@ -87,13 +248,10 @@ class TabBehaviorTests(unittest.TestCase):
 
                 self.assertEqual(result, "break")
 
-        self.assertEqual(
-            application.acquire_and_analyze.call_args_list,
-            [
-                call(channel_a_range_override=main.CHANNEL_A_FIXED_RANGE),
-                call(),
-            ],
+        application.acquire_and_analyze.assert_called_once_with(
+            channel_a_range_override=main.CHANNEL_A_FIXED_RANGE,
         )
+        application._advanced_acquire_and_analyze.assert_called_once_with()
         application.recalculate.assert_not_called()
 
     def test_empty_distance_does_not_acquire_and_advanced_input_recalculates(self) -> None:
@@ -103,12 +261,14 @@ class TabBehaviorTests(unittest.TestCase):
         application.distance_entries = (distance_entry, object())
         application.distance_mm_var = FakeStringVar("")
         application.acquire_and_analyze = Mock()
+        application._advanced_acquire_and_analyze = Mock()
         application.recalculate = Mock()
 
         application._enter_pressed(SimpleNamespace(widget=distance_entry))
         application._enter_pressed(SimpleNamespace(widget=object()))
 
         application.acquire_and_analyze.assert_not_called()
+        application._advanced_acquire_and_analyze.assert_not_called()
         application.recalculate.assert_called_once_with()
 
     def test_result_focus_returns_to_distance_entry_on_selected_tab(self) -> None:
@@ -133,6 +293,41 @@ class TabBehaviorTests(unittest.TestCase):
                 expected.icursor.assert_called_once_with(tk.END)
                 expected.selection_range.assert_called_once_with(0, tk.END)
                 other.focus_set.assert_not_called()
+
+    def test_continuous_measurement_controls_follow_on_off_and_busy_state(
+        self,
+    ) -> None:
+        application = object.__new__(main.MeasurementApplication)
+        application._busy = False
+        application.continuous_measurement_enabled_var = FakeBooleanVar(False)
+        application.continuous_measurement_checkbutton = Mock()
+        application.continuous_measurement_count_combobox = Mock()
+
+        application._update_continuous_measurement_controls()
+
+        application.continuous_measurement_checkbutton.configure.assert_called_with(
+            state="normal"
+        )
+        application.continuous_measurement_count_combobox.configure.assert_called_with(
+            state="disabled"
+        )
+
+        application.continuous_measurement_enabled_var.set(True)
+        application._update_continuous_measurement_controls()
+
+        application.continuous_measurement_count_combobox.configure.assert_called_with(
+            state="readonly"
+        )
+
+        application._busy = True
+        application._update_continuous_measurement_controls()
+
+        application.continuous_measurement_checkbutton.configure.assert_called_with(
+            state="disabled"
+        )
+        application.continuous_measurement_count_combobox.configure.assert_called_with(
+            state="disabled"
+        )
 
     def test_basic_channel_b_buttons_change_one_step_without_changing_advanced_a(
         self,
@@ -566,6 +761,296 @@ class TabBehaviorTests(unittest.TestCase):
             main.PICOSCOPE_RANGES["±5 V"],
         )
 
+    def test_continuous_measurement_runs_serially_averages_speed_and_draws_last(
+        self,
+    ) -> None:
+        application, reference, picoscope_settings = (
+            make_ready_picoscope_application()
+        )
+        measurements = [
+            make_signal(f"measurement-{index}", marker=float(index))
+            for index in range(1, 4)
+        ]
+        speeds = (1000.0, 1200.0, 1700.0)
+        results = [
+            make_analysis_result(measurement, reference, speed, float(index * 10))
+            for index, (measurement, speed) in enumerate(
+                zip(measurements, speeds, strict=True),
+                start=1,
+            )
+        ]
+        events: list[str] = []
+        measurement_indexes = {id(item): index for index, item in enumerate(measurements, 1)}
+        acquisition_iterator = iter(measurements)
+
+        def acquire_signal(
+            settings: main.PicoScopeSettings,
+            role: str,
+        ) -> tuple[main.SignalData, float]:
+            self.assertIs(settings, picoscope_settings)
+            self.assertEqual(role, "実測")
+            measurement = next(acquisition_iterator)
+            events.append(f"acquire-{measurement_indexes[id(measurement)]}")
+            return measurement, 8e-9
+
+        def analyze(
+            measurement: main.SignalData,
+            acquired_reference: main.SignalData,
+            _parameters: main.AnalysisParameters,
+            _window_parameters: main.WindowParameters,
+        ) -> main.AnalysisResult:
+            index = measurement_indexes[id(measurement)]
+            events.append(f"analyze-{index}")
+            self.assertIs(acquired_reference, reference)
+            return results[index - 1]
+
+        application._draw_result.side_effect = lambda *_args: events.append("draw")
+        with (
+            patch("main.threading.Thread") as thread_class,
+            patch("main.acquire_picoscope_signal", side_effect=acquire_signal),
+            patch("main.run_analysis", side_effect=analyze) as run_analysis,
+        ):
+            application._start_analysis(load_new_data=True, measurement_count=3)
+            thread_class.call_args.kwargs["target"]()
+
+        self.assertEqual(
+            events,
+            [
+                "acquire-1",
+                "analyze-1",
+                "acquire-2",
+                "analyze-2",
+                "acquire-3",
+                "analyze-3",
+                "draw",
+            ],
+        )
+        self.assertEqual(run_analysis.call_count, 3)
+        application._draw_result.assert_called_once()
+        displayed_result, displayed_range = application._draw_result.call_args.args
+        self.assertIs(displayed_result.measurement, measurements[-1])
+        np.testing.assert_array_equal(
+            displayed_result.filtered_channel_1,
+            results[-1].filtered_channel_1,
+        )
+        self.assertAlmostEqual(displayed_result.sound_speed_m_s, 1300.0)
+        self.assertEqual(displayed_range, (0.0, 20.0))
+        self.assertIs(application.current_measurement, measurements[-1])
+        self.assertIs(application.current_result, displayed_result)
+        application._update_result_labels.assert_called_once_with(displayed_result)
+        self.assertEqual(
+            application._set_busy.call_args_list,
+            [call(True), call(False)],
+        )
+        self.assertIn("3回の音速を平均", application.status_var.get())
+        thread_class.return_value.start.assert_called_once_with()
+
+    def test_basic_measurement_stays_single_when_advanced_continuous_is_on(
+        self,
+    ) -> None:
+        application, reference, _picoscope_settings = (
+            make_ready_picoscope_application()
+        )
+        application.continuous_measurement_enabled_var = FakeBooleanVar(True)
+        application.continuous_measurement_count_var = FakeStringVar("5")
+        measurement = make_signal("basic measurement", marker=1.0)
+        result = make_analysis_result(measurement, reference, 1250.0, 1.0)
+
+        with (
+            patch("main.threading.Thread") as thread_class,
+            patch(
+                "main.acquire_picoscope_signal",
+                return_value=(measurement, 8e-9),
+            ) as acquire_signal,
+            patch("main.run_analysis", return_value=result) as run_analysis,
+        ):
+            application._basic_acquire_measurement()
+            thread_class.call_args.kwargs["target"]()
+
+        acquire_signal.assert_called_once()
+        run_analysis.assert_called_once()
+        application._draw_result.assert_called_once()
+        displayed_result = application._draw_result.call_args.args[0]
+        self.assertIs(displayed_result, result)
+        self.assertEqual(displayed_result.sound_speed_m_s, 1250.0)
+        self.assertNotIn("回の音速を平均", application.status_var.get())
+
+    def test_continuous_analysis_failure_stops_and_keeps_latest_reusable_waveform(
+        self,
+    ) -> None:
+        application, reference, _picoscope_settings = (
+            make_ready_picoscope_application()
+        )
+        measurements = [
+            make_signal("measurement-1", marker=1.0),
+            make_signal("measurement-2", marker=2.0),
+            make_signal("measurement-3", marker=3.0),
+        ]
+        first_result = make_analysis_result(
+            measurements[0],
+            reference,
+            1000.0,
+            1.0,
+        )
+        error = RuntimeError("second analysis failed")
+
+        with (
+            patch("main.threading.Thread") as thread_class,
+            patch(
+                "main.acquire_picoscope_signal",
+                side_effect=[(item, 8e-9) for item in measurements],
+            ) as acquire_signal,
+            patch(
+                "main.run_analysis",
+                side_effect=[first_result, error],
+            ) as run_analysis,
+        ):
+            application._start_analysis(load_new_data=True, measurement_count=3)
+            thread_class.call_args.kwargs["target"]()
+
+        self.assertEqual(acquire_signal.call_count, 2)
+        self.assertEqual(run_analysis.call_count, 2)
+        application._draw_result.assert_not_called()
+        self.assertIsNone(application.current_result)
+        self.assertIs(application.current_measurement, measurements[1])
+        self.assertEqual(application.current_measurement_sample_interval_s, 8e-9)
+        self.assertIn("実測データは取得済み", application.status_var.get())
+        application._show_error.assert_called_once_with(error)
+        self.assertEqual(
+            application._set_busy.call_args_list,
+            [call(True), call(False)],
+        )
+
+    def test_later_acquisition_failure_does_not_reuse_previous_iteration(
+        self,
+    ) -> None:
+        application, reference, _picoscope_settings = (
+            make_ready_picoscope_application()
+        )
+        first_measurement = make_signal("measurement-1", marker=1.0)
+        first_result = make_analysis_result(
+            first_measurement,
+            reference,
+            1000.0,
+            1.0,
+        )
+        error = RuntimeError("second acquisition failed")
+
+        with (
+            patch("main.threading.Thread") as thread_class,
+            patch(
+                "main.acquire_picoscope_signal",
+                side_effect=[(first_measurement, 8e-9), error],
+            ) as acquire_signal,
+            patch("main.run_analysis", return_value=first_result) as run_analysis,
+        ):
+            application._start_analysis(load_new_data=True, measurement_count=3)
+            thread_class.call_args.kwargs["target"]()
+
+        self.assertEqual(acquire_signal.call_count, 2)
+        run_analysis.assert_called_once()
+        application._draw_result.assert_not_called()
+        self.assertIsNone(application.current_measurement)
+        self.assertIsNone(application.current_measurement_sample_interval_s)
+        self.assertIn("取得または解析に失敗", application.status_var.get())
+        application._show_error.assert_called_once_with(error)
+
+    def test_continuous_time_resolution_change_stops_and_discards_reference(
+        self,
+    ) -> None:
+        application, reference, _picoscope_settings = (
+            make_ready_picoscope_application()
+        )
+        measurements = [
+            make_signal("measurement-1", marker=1.0),
+            make_signal("measurement-2", marker=2.0),
+            make_signal("measurement-3", marker=3.0),
+        ]
+        first_result = make_analysis_result(
+            measurements[0],
+            reference,
+            1000.0,
+            1.0,
+        )
+
+        with (
+            patch("main.threading.Thread") as thread_class,
+            patch(
+                "main.acquire_picoscope_signal",
+                side_effect=[
+                    (measurements[0], 8e-9),
+                    (measurements[1], 16e-9),
+                    (measurements[2], 8e-9),
+                ],
+            ) as acquire_signal,
+            patch("main.run_analysis", return_value=first_result) as run_analysis,
+        ):
+            application._start_analysis(load_new_data=True, measurement_count=3)
+            thread_class.call_args.kwargs["target"]()
+
+        self.assertEqual(acquire_signal.call_count, 2)
+        run_analysis.assert_called_once()
+        application._draw_result.assert_not_called()
+        application._discard_acquired_data.assert_called_once_with()
+        error = application._show_error.call_args.args[0]
+        self.assertIsInstance(error, main.TimeResolutionMismatchError)
+        self.assertIn("参照波形を取り直してください", application.status_var.get())
+        self.assertEqual(
+            application._set_busy.call_args_list,
+            [call(True), call(False)],
+        )
+
+    def test_continuous_measurement_requires_distance_before_starting_thread(
+        self,
+    ) -> None:
+        for distance_mm in (None, 0.0):
+            with self.subTest(distance_mm=distance_mm):
+                application, _reference, _picoscope_settings = (
+                    make_ready_picoscope_application()
+                )
+                parameters, window_parameters, display_range = (
+                    application._read_inputs.return_value
+                )
+                application._read_inputs.return_value = (
+                    main.AnalysisParameters(
+                        sample_interval_s=parameters.sample_interval_s,
+                        filter_low_hz=parameters.filter_low_hz,
+                        filter_high_hz=parameters.filter_high_hz,
+                        filter_order=parameters.filter_order,
+                        filter_passes=parameters.filter_passes,
+                        distance_mm=distance_mm,
+                    ),
+                    window_parameters,
+                    display_range,
+                )
+
+                with patch("main.threading.Thread") as thread_class:
+                    application._start_analysis(
+                        load_new_data=True,
+                        measurement_count=2,
+                    )
+
+                thread_class.assert_not_called()
+                application._set_busy.assert_not_called()
+                application._show_error.assert_called_once()
+                self.assertIn(
+                    "距離",
+                    str(application._show_error.call_args.args[0]),
+                )
+
+    def test_start_analysis_ignores_new_request_while_busy(self) -> None:
+        application, _reference, _picoscope_settings = (
+            make_ready_picoscope_application()
+        )
+        application._busy = True
+
+        with patch("main.threading.Thread") as thread_class:
+            application._start_analysis(load_new_data=True, measurement_count=3)
+
+        application._read_inputs.assert_not_called()
+        application._set_busy.assert_not_called()
+        thread_class.assert_not_called()
+
     def test_analysis_can_start_after_channel_b_range_change(self) -> None:
         application = object.__new__(main.MeasurementApplication)
         application._busy = False
@@ -967,6 +1452,9 @@ class TabBehaviorTests(unittest.TestCase):
         )
         for name in range_button_names:
             setattr(application, name, Mock())
+        application.continuous_measurement_enabled_var = FakeBooleanVar(True)
+        application.continuous_measurement_checkbutton = Mock()
+        application.continuous_measurement_count_combobox = Mock()
         application.channel_b_range_var.set("±10 V")
 
         application._set_busy(True)
@@ -995,6 +1483,30 @@ class TabBehaviorTests(unittest.TestCase):
                 widget.configure.call_args_list[-1].kwargs["state"],
                 "normal",
             )
+        self.assertEqual(
+            application.continuous_measurement_checkbutton.configure.call_args_list[
+                -2
+            ].kwargs["state"],
+            "disabled",
+        )
+        self.assertEqual(
+            application.continuous_measurement_checkbutton.configure.call_args_list[
+                -1
+            ].kwargs["state"],
+            "normal",
+        )
+        self.assertEqual(
+            application.continuous_measurement_count_combobox.configure.call_args_list[
+                -2
+            ].kwargs["state"],
+            "disabled",
+        )
+        self.assertEqual(
+            application.continuous_measurement_count_combobox.configure.call_args_list[
+                -1
+            ].kwargs["state"],
+            "readonly",
+        )
 
 
 if __name__ == "__main__":
