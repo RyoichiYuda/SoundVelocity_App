@@ -23,6 +23,28 @@ class FakeNotebook:
 
 
 class TabBehaviorTests(unittest.TestCase):
+    def test_interface_fonts_grow_one_step_without_changing_graph_font(self) -> None:
+        point_font = Mock()
+        point_font.cget.return_value = "10"
+        pixel_font = Mock()
+        pixel_font.cget.return_value = "-12"
+
+        def named_font(font_name: str, *, root: object) -> Mock:
+            del root
+            if font_name == "TkDefaultFont":
+                return point_font
+            if font_name == "TkTextFont":
+                return pixel_font
+            raise tk.TclError("font not available")
+
+        graph_font_size = main.rcParams["font.size"]
+        with patch("main.tkfont.nametofont", side_effect=named_font):
+            main.enlarge_interface_fonts(object())
+
+        point_font.configure.assert_called_once_with(size=11)
+        pixel_font.configure.assert_called_once_with(size=-13)
+        self.assertEqual(main.rcParams["font.size"], graph_font_size)
+
     def test_basic_reference_button_always_acquires_reference(self) -> None:
         application = object.__new__(main.MeasurementApplication)
         application.acquire_reference = Mock()

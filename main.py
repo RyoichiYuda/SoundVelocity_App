@@ -22,7 +22,7 @@ import threading
 import tkinter as tk
 from dataclasses import dataclass, replace
 from pathlib import Path
-from tkinter import filedialog, messagebox, ttk
+from tkinter import filedialog, font as tkfont, messagebox, ttk
 
 import numpy as np
 import pypicosdk as psdk
@@ -170,6 +170,12 @@ CHANNEL_B_RANGE_VALUES = tuple(PICOSCOPE_RANGES)
 BASIC_SPEED_BORDER_COLOR = "#0B6E99"
 BASIC_SPEED_BACKGROUND_COLOR = "#E8F6FB"
 BASIC_SPEED_TEXT_COLOR = "#073B4C"
+# 「参照波形を取得」ボタンの文字色はここで変更する。
+BASIC_REFERENCE_BUTTON_TEXT_COLOR = "#00FE33"
+# 基本タブの−／＋ボタンの一辺（ピクセル）。
+BASIC_RANGE_STEP_BUTTON_SIZE_PX = 64
+# 基本タブの参照／実測ボタンの高さ（ピクセル）。
+BASIC_ACQUISITION_BUTTON_HEIGHT_PX = 96
 BASIC_DISPLAY_NORMAL_US = 40.0
 BASIC_DISPLAY_EXPANDED_US = 80.0
 
@@ -300,6 +306,30 @@ def configure_plot_font() -> None:
     rcParams["axes.unicode_minus"] = False
 
 
+def enlarge_interface_fonts(root: tk.Misc) -> None:
+    """グラフ以外のTk標準フォントを1段階大きくする。"""
+
+    for font_name in (
+        "TkDefaultFont",
+        "TkTextFont",
+        "TkFixedFont",
+        "TkMenuFont",
+        "TkHeadingFont",
+        "TkCaptionFont",
+        "TkSmallCaptionFont",
+        "TkIconFont",
+        "TkTooltipFont",
+    ):
+        try:
+            interface_font = tkfont.nametofont(font_name, root=root)
+            current_size = int(interface_font.cget("size"))
+        except tk.TclError:
+            continue
+        interface_font.configure(
+            size=current_size + 1 if current_size >= 0 else current_size - 1
+        )
+
+
 class ScrollableControls(ttk.Frame):
     """画面左側の入力欄を縦スクロール可能にする部品。
 
@@ -425,20 +455,34 @@ class MeasurementApplication:
     def _build_ui(self) -> None:
         """基本・アドバンスドの2タブと、それぞれの計測画面を組み立てる。"""
 
+        # Matplotlibのグラフ文字は変えず、Tkinter側の文字だけを大きくする。
+        enlarge_interface_fonts(self.root)
+
         # ttkの共通見た目を設定する。解析結果だけ少し太字で強調する。
         style = ttk.Style(self.root)
         style.configure("TButton", padding=(8, 5))
-        style.configure("Result.TLabel", font=("TkDefaultFont", 11, "bold"))
-        style.configure("BasicResult.TLabel", font=("TkDefaultFont", 13, "bold"))
+        style.configure("Result.TLabel", font=("TkDefaultFont", 12, "bold"))
+        style.configure("BasicResult.TLabel", font=("TkDefaultFont", 14, "bold"))
         style.configure("TNotebook.Tab", padding=(18, 8))
         style.configure(
             "RangeStep.TButton",
-            font=("TkDefaultFont", 18, "bold"),
-            padding=(14, 7),
+            font=("TkDefaultFont", 19, "bold"),
+            padding=(0, 0),
         )
         style.configure(
             "RangeValue.TLabel",
+            font=("TkDefaultFont", 14, "bold"),
+        )
+        style.configure(
+            "BasicAcquisition.TButton",
+            font=("TkDefaultFont", 12, "bold"),
+            padding=(16, 8),
+        )
+        style.configure(
+            "BasicReference.TButton",
             font=("TkDefaultFont", 13, "bold"),
+            foreground=BASIC_REFERENCE_BUTTON_TEXT_COLOR,
+            padding=(16, 8),
         )
 
         self.root.rowconfigure(0, weight=1)
@@ -471,40 +515,54 @@ class MeasurementApplication:
             padx=10,
             pady=(10, 6),
         )
-        operation_frame.columnconfigure(2, weight=1)
+        # 取得領域と、3つの要素間隔だけで余白を分ける。
+        # 5:3:3:3にすることで、標準画面で取得ボタンを従来の
+        # 約60%幅にしつつ、狭い画面にも追従させる。
+        operation_frame.columnconfigure(0, weight=5)
+        for gap_column in (1, 3, 5):
+            operation_frame.columnconfigure(
+                gap_column,
+                weight=3,
+                uniform="basic_operation_gaps",
+            )
 
         basic_acquisition_frame = ttk.Frame(operation_frame)
         basic_acquisition_frame.grid(
             row=0,
             column=0,
-            padx=(0, 6),
             sticky="ew",
         )
         basic_acquisition_frame.columnconfigure(0, weight=1)
+        basic_acquisition_frame.rowconfigure(
+            (0, 2),
+            minsize=BASIC_ACQUISITION_BUTTON_HEIGHT_PX,
+        )
+        basic_acquisition_frame.rowconfigure(1, minsize=6)
 
         self.basic_reference_button = ttk.Button(
             basic_acquisition_frame,
             text="参照波形を取得",
             command=self._basic_acquire_reference,
+            style="BasicReference.TButton",
         )
-        self.basic_reference_button.grid(row=0, column=0, sticky="ew")
+        self.basic_reference_button.grid(row=0, column=0, sticky="nsew")
         self.basic_acquire_button = ttk.Button(
             basic_acquisition_frame,
             text="実測波形を取得・計算",
             command=self._basic_acquire_measurement,
+            style="BasicAcquisition.TButton",
         )
         self.basic_acquire_button.grid(
-            row=1,
+            row=2,
             column=0,
-            sticky="ew",
-            pady=(6, 0),
+            sticky="nsew",
         )
         range_frame = ttk.LabelFrame(
             operation_frame,
             text="入力レンジ",
             padding=(8, 4),
         )
-        range_frame.grid(row=0, column=1, padx=(0, 18), sticky="ew")
+        range_frame.grid(row=0, column=2, sticky="ew")
         ttk.Label(
             range_frame,
             text=f"A  {CHANNEL_A_FIXED_RANGE}（固定）",
@@ -518,11 +576,10 @@ class MeasurementApplication:
         )
         display_time_frame.grid(
             row=0,
-            column=2,
-            padx=(0, 18),
+            column=4,
             sticky="ew",
         )
-        display_time_frame.columnconfigure((0, 1), weight=1)
+        display_time_frame.columnconfigure(0, weight=1)
         self.basic_display_normal_button = ttk.Button(
             display_time_frame,
             text="通常（40 µs）",
@@ -535,7 +592,6 @@ class MeasurementApplication:
             row=0,
             column=0,
             sticky="ew",
-            padx=(0, 3),
         )
         self.basic_display_expanded_button = ttk.Button(
             display_time_frame,
@@ -546,14 +602,14 @@ class MeasurementApplication:
             ),
         )
         self.basic_display_expanded_button.grid(
-            row=0,
-            column=1,
+            row=1,
+            column=0,
             sticky="ew",
-            padx=(3, 0),
+            pady=(6, 0),
         )
 
         distance_frame = ttk.Frame(operation_frame)
-        distance_frame.grid(row=0, column=3, sticky="e")
+        distance_frame.grid(row=0, column=6, sticky="e")
         ttk.Label(distance_frame, text="距離 [mm]").grid(
             row=0,
             column=0,
@@ -622,7 +678,7 @@ class MeasurementApplication:
             text="音速",
             background=BASIC_SPEED_BACKGROUND_COLOR,
             foreground=BASIC_SPEED_TEXT_COLOR,
-            font=("TkDefaultFont", 13, "bold"),
+            font=("TkDefaultFont", 14, "bold"),
             anchor="w",
         ).pack(fill="x")
         self.basic_speed_value_label = tk.Label(
@@ -630,7 +686,7 @@ class MeasurementApplication:
             textvariable=self.result_speed_var,
             background=BASIC_SPEED_BACKGROUND_COLOR,
             foreground=BASIC_SPEED_TEXT_COLOR,
-            font=("TkDefaultFont", 26, "bold"),
+            font=("TkDefaultFont", 27, "bold"),
             anchor="center",
         )
         self.basic_speed_value_label.pack(fill="both", expand=True, pady=(2, 0))
@@ -686,14 +742,22 @@ class MeasurementApplication:
         stepper.grid(row=row, column=column, sticky="ew")
         stepper.columnconfigure(1, weight=1)
 
-        decrease_button = ttk.Button(
+        decrease_holder = ttk.Frame(
             stepper,
+            width=BASIC_RANGE_STEP_BUTTON_SIZE_PX,
+            height=BASIC_RANGE_STEP_BUTTON_SIZE_PX,
+        )
+        decrease_holder.grid(row=0, column=0, padx=(0, 8))
+        decrease_holder.grid_propagate(False)
+        decrease_holder.rowconfigure(0, weight=1)
+        decrease_holder.columnconfigure(0, weight=1)
+        decrease_button = ttk.Button(
+            decrease_holder,
             text="−",
-            width=3,
             style="RangeStep.TButton",
             command=self._basic_range_minus_pressed,
         )
-        decrease_button.grid(row=0, column=0, padx=(0, 8))
+        decrease_button.grid(row=0, column=0, sticky="nsew")
         ttk.Label(
             stepper,
             textvariable=self.channel_b_range_var,
@@ -701,14 +765,22 @@ class MeasurementApplication:
             anchor="center",
             width=10,
         ).grid(row=0, column=1, sticky="ew")
-        increase_button = ttk.Button(
+        increase_holder = ttk.Frame(
             stepper,
+            width=BASIC_RANGE_STEP_BUTTON_SIZE_PX,
+            height=BASIC_RANGE_STEP_BUTTON_SIZE_PX,
+        )
+        increase_holder.grid(row=0, column=2, padx=(8, 0))
+        increase_holder.grid_propagate(False)
+        increase_holder.rowconfigure(0, weight=1)
+        increase_holder.columnconfigure(0, weight=1)
+        increase_button = ttk.Button(
+            increase_holder,
             text="＋",
-            width=3,
             style="RangeStep.TButton",
             command=self._basic_range_plus_pressed,
         )
-        increase_button.grid(row=0, column=2, padx=(8, 0))
+        increase_button.grid(row=0, column=0, sticky="nsew")
 
         setattr(self, f"{prefix}_range_decrease_button", decrease_button)
         setattr(self, f"{prefix}_range_increase_button", increase_button)

@@ -6,7 +6,7 @@
     "reference_path": "data/zero_ref.csv"
   },
   "picoscope": {
-    "capture_duration_us": 40.0,
+    "capture_duration_us": 80.0,
     "trigger_a_threshold_mv": -2000.0,
     "trigger_a_direction": "falling",
     "resolution_bits": 8,
