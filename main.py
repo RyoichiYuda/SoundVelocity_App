@@ -173,6 +173,8 @@ PICOSCOPE_RANGES = {
 # 基本タブからの取得ではChannel Aを±20 Vに固定する。アドバンスドタブでは
 # 従来どおりプルダウンの選択値を使うため、UI変数とは分けて定数化する。
 CHANNEL_A_FIXED_RANGE = "±20 V"
+# 参照波形の取得時だけ、両タブ共通でChannel Bをこのレンジに固定する。
+REFERENCE_CHANNEL_B_FIXED_RANGE = "±10 V"
 CHANNEL_B_RANGE_VALUES = tuple(PICOSCOPE_RANGES)
 BASIC_SPEED_BORDER_COLOR = "#0B6E99"
 BASIC_SPEED_BACKGROUND_COLOR = "#E8F6FB"
@@ -1687,6 +1689,7 @@ class MeasurementApplication:
     def _read_picoscope_settings(
         self,
         channel_a_range_override: str | None = None,
+        channel_b_range_override: str | None = None,
     ) -> PicoScopeSettings:
         """PicoScope設定欄を読み、取得モジュールへ渡す値へ変換する。"""
 
@@ -1702,9 +1705,14 @@ class MeasurementApplication:
             if channel_a_range_override is not None
             else self.channel_a_range_var.get()
         )
+        channel_b_range = (
+            channel_b_range_override
+            if channel_b_range_override is not None
+            else self.channel_b_range_var.get()
+        )
         if channel_a_range not in PICOSCOPE_RANGES:
             raise ValueError("対応していないChannel A入力レンジです。")
-        if self.channel_b_range_var.get() not in PICOSCOPE_RANGES:
+        if channel_b_range not in PICOSCOPE_RANGES:
             raise ValueError("対応していないChannel B入力レンジです。")
 
         trigger_a_threshold_mv = self._parse_float(
@@ -1733,7 +1741,7 @@ class MeasurementApplication:
                 self.picoscope_resolution_var.get()
             ],
             channel_a_range=PICOSCOPE_RANGES[channel_a_range],
-            channel_b_range=PICOSCOPE_RANGES[self.channel_b_range_var.get()],
+            channel_b_range=PICOSCOPE_RANGES[channel_b_range],
         )
 
     def _read_window_parameters(self) -> WindowParameters:
@@ -2009,7 +2017,7 @@ class MeasurementApplication:
         self,
         channel_a_range_override: str | None = None,
     ) -> None:
-        """参照波形を取得して保持し、次の実測取得を待つ。"""
+        """参照波形を取得して保持する。実機のChannel Bは常に±10 Vで取得する。"""
 
         if self._busy:
             return
@@ -2025,6 +2033,7 @@ class MeasurementApplication:
                 csv_source = None
                 picoscope_settings = self._read_picoscope_settings(
                     channel_a_range_override,
+                    channel_b_range_override=REFERENCE_CHANNEL_B_FIXED_RANGE,
                 )
         except Exception as exc:
             self._show_error(exc)

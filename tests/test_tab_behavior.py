@@ -11,7 +11,11 @@ import tkinter as tk
 from matplotlib.figure import Figure
 
 import main
-from tests.test_main_settings import FakeBooleanVar, FakeStringVar
+from tests.test_main_settings import (
+    FakeBooleanVar,
+    FakeStringVar,
+    make_application_without_tk,
+)
 
 
 class FakeNotebook:
@@ -167,6 +171,100 @@ class TabBehaviorTests(unittest.TestCase):
         application.acquire_and_analyze.assert_called_once_with(
             channel_a_range_override=main.CHANNEL_A_FIXED_RANGE,
         )
+
+    def test_reference_uses_fixed_b_range_then_measurement_uses_selected_range(
+        self,
+    ) -> None:
+        for basic_tab, expected_a_range in ((True, "±20 V"), (False, "±5 V")):
+            for selected_b_range in main.PICOSCOPE_RANGES:
+                with self.subTest(basic=basic_tab, selected_b=selected_b_range):
+                    application = make_application_without_tk()
+                    application._apply_settings(main.ApplicationSettings(
+                        channel_a_range_mv=5000,
+                        distance_mm=10.0,
+                    ))
+                    application.channel_b_range_var.set(selected_b_range)
+                    application.root = SimpleNamespace(
+                        after=lambda _delay, callback: callback()
+                    )
+                    application._clear_result_display = Mock()
+                    application._set_busy = Mock()
+                    application._select_distance_for_next_measurement = Mock()
+                    application._draw_result = Mock()
+                    application._update_result_labels = Mock()
+                    application._show_error = Mock()
+                    capture = SimpleNamespace(
+                        time_s=np.arange(8, dtype=float) * 8e-9,
+                        channel_a_mv=np.arange(8, dtype=float),
+                        channel_b_mv=-np.arange(8, dtype=float),
+                        device_variant="test",
+                        sample_interval_s=8e-9,
+                    )
+
+                    with (
+                        patch("main.threading.Thread") as thread_class,
+                        patch("main.acquire_waveform", return_value=capture) as acquire,
+                        patch("main.run_analysis") as analyze,
+                    ):
+                        if basic_tab:
+                            application._basic_acquire_reference()
+                        else:
+                            application.acquire_reference()
+                        thread_class.call_args.kwargs["target"]()
+                        reference = application.current_reference
+                        self.assertIsNotNone(reference)
+                        reference_arguments = acquire.call_args.kwargs
+                        self.assertEqual(
+                            reference_arguments["channel_b_range"],
+                            main.PICOSCOPE_RANGES["±10 V"],
+                        )
+                        self.assertEqual(application.channel_b_range_var.get(), selected_b_range)
+                        self.assertEqual(application.channel_a_range_var.get(), "±5 V")
+
+                        analyze.side_effect = lambda measurement, ref, *_args: (
+                            make_analysis_result(measurement, ref, 1250.0, 1.0)
+                        )
+                        if basic_tab:
+                            application._basic_acquire_measurement()
+                        else:
+                            application._advanced_acquire_and_analyze()
+                        thread_class.call_args.kwargs["target"]()
+
+                    application._show_error.assert_not_called()
+                    self.assertEqual(acquire.call_count, 2)
+                    measurement_arguments = acquire.call_args.kwargs
+                    expected_measurement_arguments = dict(reference_arguments)
+                    expected_measurement_arguments["channel_b_range"] = (
+                        main.PICOSCOPE_RANGES[selected_b_range]
+                    )
+                    self.assertEqual(measurement_arguments, expected_measurement_arguments)
+                    self.assertEqual(
+                        reference_arguments["channel_a_range"],
+                        main.PICOSCOPE_RANGES[expected_a_range],
+                    )
+                    self.assertEqual(application.current_reference_sample_interval_s, 8e-9)
+                    analyze.assert_called_once()
+                    self.assertIs(analyze.call_args.args[1], reference)
+
+    def test_csv_reference_does_not_read_picoscope_ranges(self) -> None:
+        application, _reference, _settings = make_ready_picoscope_application()
+        application.source_mode_var.set(main.SOURCE_CSV)
+        application.reference_path_var = FakeStringVar("data/zero_ref.csv")
+        reference = make_signal("csv reference")
+
+        with (
+            patch("main.threading.Thread") as thread_class,
+            patch("main.CsvDataSource") as csv_source,
+            patch("main.acquire_waveform") as acquire,
+        ):
+            csv_source.return_value.acquire.return_value = reference
+            application.acquire_reference()
+            thread_class.call_args.kwargs["target"]()
+
+        application._show_error.assert_not_called()
+        application._read_picoscope_settings.assert_not_called()
+        acquire.assert_not_called()
+        self.assertIs(application.current_reference, reference)
 
     def test_advanced_continuous_on_uses_selected_measurement_count(self) -> None:
         application = object.__new__(main.MeasurementApplication)
